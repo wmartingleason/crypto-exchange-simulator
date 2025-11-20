@@ -1,20 +1,21 @@
-"""WebSocket server for the exchange simulator."""
+"""Exchange simulator server."""
 
 import asyncio
 import logging
-from typing import Optional
-from websockets.server import serve, WebSocketServerProtocol
+from aiohttp import web
+import aiohttp
 
 from .config import Config
+from .engine.exchange import ExchangeEngine
+from .engine.accounts import AccountManager
 from .connection_manager import ConnectionManager
 from .message_router import MessageRouter
 from .failure_injector import FailureInjector
-from .engine.exchange import ExchangeEngine
-from .engine.accounts import AccountManager
-from .market_data.generator import MarketDataGenerator, MarketDataPublisher, RandomWalkModel, GBMPriceModel
+from .market_data.generator import MarketDataPublisher, RandomWalkModel, GBMPriceModel
+from .rest_api import RestAPIHandler, create_rest_routes
 from .handlers.order import OrderHandler
 from .handlers.subscription import SubscriptionHandler
-from .handlers.heartbeat import HeartbeatHandler
+from .models.messages import MessageType
 from .failures.strategies import (
     DropMessageStrategy,
     DelayMessageStrategy,
@@ -23,53 +24,48 @@ from .failures.strategies import (
     CorruptMessageStrategy,
     ThrottleMessageStrategy,
 )
-from .models.messages import MessageType
 
 logger = logging.getLogger(__name__)
 
 
 class ExchangeServer:
-    """WebSocket server for the exchange simulator."""
+    """Exchange simulator server."""
 
-    def __init__(self, config: Config) -> None:
-        """Initialize the exchange server.
-
-        Args:
-            config: Server configuration
-        """
+    def __init__(self, config: Config):
         self.config = config
+        self.app = web.Application()
+        self._runner = None
+        self._site = None
+        self._running = False
+        self._market_data_task = None
+
+        self.account_manager = AccountManager(config.exchange.default_balance)
+        self.exchange_engine = ExchangeEngine(
+            symbols=config.exchange.symbols,
+            account_manager=self.account_manager,
+        )
         self.connection_manager = ConnectionManager()
         self.message_router = MessageRouter()
         self.failure_injector = FailureInjector()
 
-        # Initialize exchange engine
-        account_manager = AccountManager(
-            default_balance=config.get_default_balance_decimal()
-        )
-        self.exchange_engine = ExchangeEngine(
-            symbols=config.exchange.symbols,
-            account_manager=account_manager,
-        )
-
-        # Initialize market data
         self.market_data_publisher = MarketDataPublisher()
         initial_prices = config.get_initial_prices_decimal()
 
-        # Create price model based on configuration
         pricing_config = config.exchange.pricing_model
         if pricing_config.model_type == "gbm":
+            from .market_data.generator import MarketDataGenerator
             price_model = GBMPriceModel(
                 drift=pricing_config.drift,
                 volatility=pricing_config.volatility,
                 tick_interval_seconds=config.exchange.tick_interval,
             )
         else:
-            # Fallback to random walk for backward compatibility
             price_model = RandomWalkModel(volatility=pricing_config.volatility)
 
         for symbol in config.exchange.symbols:
             initial_price = initial_prices.get(symbol)
             if initial_price:
+                from .market_data.generator import MarketDataGenerator
                 generator = MarketDataGenerator(
                     symbol=symbol,
                     initial_price=initial_price,
@@ -79,195 +75,171 @@ class ExchangeServer:
                 self.market_data_publisher.add_generator(generator)
                 self.exchange_engine.set_last_price(symbol, initial_price)
 
-        # Register message handlers
-        self._register_handlers()
-
-        # Configure failure injection
         if config.failures.enabled:
             self._configure_failures()
         else:
             self.failure_injector.disable()
 
-        self._server = None
-        self._running = False
-        self._market_data_task: Optional[asyncio.Task] = None
+        self._register_handlers()
+        self._setup_rest_api()
+        self.app.router.add_get("/ws", self._handle_websocket)
 
     def _register_handlers(self) -> None:
-        """Register message handlers."""
         order_handler = OrderHandler(self.exchange_engine)
         subscription_handler = SubscriptionHandler(self.connection_manager)
-        heartbeat_handler = HeartbeatHandler()
 
-        # Register handlers for different message types
         self.message_router.register_handler(MessageType.PLACE_ORDER, order_handler)
         self.message_router.register_handler(MessageType.CANCEL_ORDER, order_handler)
         self.message_router.register_handler(MessageType.GET_ORDER, order_handler)
         self.message_router.register_handler(MessageType.GET_ORDERS, order_handler)
         self.message_router.register_handler(MessageType.SUBSCRIBE, subscription_handler)
         self.message_router.register_handler(MessageType.UNSUBSCRIBE, subscription_handler)
-        self.message_router.register_handler(MessageType.PING, heartbeat_handler)
 
     def _configure_failures(self) -> None:
-        """Configure failure injection strategies."""
-        for mode_name, mode_config in self.config.failures.modes.items():
-            if not mode_config.enabled:
-                continue
+        modes = self.config.failures.modes
 
-            if mode_name == "drop_messages" and mode_config.probability is not None:
-                strategy = DropMessageStrategy(probability=mode_config.probability)
-                self.failure_injector.add_inbound_strategy(strategy)
-                self.failure_injector.add_outbound_strategy(strategy)
+        if modes.get("drop_messages", {}).get("enabled"):
+            cfg = modes["drop_messages"]
+            self.failure_injector.add_inbound_strategy(
+                DropMessageStrategy(probability=cfg.get("probability", 0.1))
+            )
 
-            elif mode_name == "delay_messages" and mode_config.min_ms is not None and mode_config.max_ms is not None:
-                strategy = DelayMessageStrategy(
-                    min_ms=mode_config.min_ms,
-                    max_ms=mode_config.max_ms,
+        if modes.get("delay_messages", {}).get("enabled"):
+            cfg = modes["delay_messages"]
+            self.failure_injector.add_inbound_strategy(
+                DelayMessageStrategy(
+                    min_delay_ms=cfg.get("min_ms", 100),
+                    max_delay_ms=cfg.get("max_ms", 1000),
                 )
-                self.failure_injector.add_outbound_strategy(strategy)
+            )
 
-            elif mode_name == "duplicate_messages" and mode_config.probability is not None:
-                strategy = DuplicateMessageStrategy(
-                    probability=mode_config.probability,
-                    max_duplicates=mode_config.max_duplicates or 2,
+        if modes.get("duplicate_messages", {}).get("enabled"):
+            cfg = modes["duplicate_messages"]
+            self.failure_injector.add_outbound_strategy(
+                DuplicateMessageStrategy(
+                    probability=cfg.get("probability", 0.05),
+                    max_duplicates=cfg.get("max_duplicates", 2),
                 )
-                self.failure_injector.add_outbound_strategy(strategy)
+            )
 
-            elif mode_name == "reorder_messages" and mode_config.window_size is not None:
-                strategy = ReorderMessagesStrategy(window_size=mode_config.window_size)
-                self.failure_injector.add_inbound_strategy(strategy)
+        if modes.get("reorder_messages", {}).get("enabled"):
+            cfg = modes["reorder_messages"]
+            self.failure_injector.add_inbound_strategy(
+                ReorderMessagesStrategy(window_size=cfg.get("window_size", 5))
+            )
 
-            elif mode_name == "corrupt_messages" and mode_config.probability is not None:
-                strategy = CorruptMessageStrategy(
-                    probability=mode_config.probability,
-                    corruption_level=mode_config.corruption_level or 0.1,
+        if modes.get("corrupt_messages", {}).get("enabled"):
+            cfg = modes["corrupt_messages"]
+            self.failure_injector.add_outbound_strategy(
+                CorruptMessageStrategy(
+                    probability=cfg.get("probability", 0.01),
+                    corruption_level=cfg.get("corruption_level", 0.1),
                 )
-                self.failure_injector.add_outbound_strategy(strategy)
+            )
 
-            elif mode_name == "throttle_messages" and mode_config.max_messages_per_second is not None:
-                strategy = ThrottleMessageStrategy(
-                    max_messages_per_second=mode_config.max_messages_per_second
+        if modes.get("throttle_messages", {}).get("enabled"):
+            cfg = modes["throttle_messages"]
+            self.failure_injector.add_inbound_strategy(
+                ThrottleMessageStrategy(
+                    max_messages_per_second=cfg.get("max_messages_per_second", 10)
                 )
-                self.failure_injector.add_inbound_strategy(strategy)
+            )
 
-    async def _handle_client(self, websocket: WebSocketServerProtocol) -> None:
-        """Handle a client connection.
+    def _setup_rest_api(self) -> None:
+        rest_handler = RestAPIHandler(
+            self.exchange_engine,
+            self.account_manager,
+            self.market_data_publisher,
+        )
+        routes = create_rest_routes(rest_handler)
+        self.app.router.add_routes(routes)
 
-        Args:
-            websocket: WebSocket connection
-        """
-        session_id = await self.connection_manager.add_connection(websocket)
+    async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        session_id = await self.connection_manager.add_connection(ws)
         logger.info(f"Client connected: {session_id}")
 
         try:
-            async for raw_message in websocket:
-                if isinstance(raw_message, str):
-                    await self._process_message(raw_message, session_id)
-                else:
-                    logger.warning(f"Received non-text message from {session_id}")
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    processed_msg = await self.failure_injector.inject_inbound(
+                        msg.data, session_id
+                    )
 
-        except Exception as e:
-            logger.error(f"Error handling client {session_id}: {e}")
+                    if processed_msg is None:
+                        continue
+
+                    response = await self.message_router.route(processed_msg, session_id)
+
+                    if response:
+                        response_str = self.message_router.serialize_message(response)
+                        final_message = await self.failure_injector.inject_outbound(
+                            response_str, session_id
+                        )
+
+                        if final_message is not None:
+                            await self.connection_manager.send_to_session(
+                                session_id, final_message
+                            )
+
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket error: {ws.exception()}")
+
         finally:
             await self.connection_manager.remove_connection(session_id)
             logger.info(f"Client disconnected: {session_id}")
 
-    async def _process_message(self, raw_message: str, session_id: str) -> None:
-        """Process a message from a client.
-
-        Args:
-            raw_message: Raw message string
-            session_id: Client session ID
-        """
-        # Apply inbound failure injection
-        processed_message = await self.failure_injector.inject_inbound(
-            raw_message, session_id
-        )
-
-        if processed_message is None:
-            # Message was dropped
-            logger.debug(f"Inbound message dropped for {session_id}")
-            return
-
-        # Update activity
-        await self.connection_manager.update_activity(session_id)
-
-        # Route message to handler
-        response = await self.message_router.route(processed_message, session_id)
-
-        if response:
-            # Serialize response
-            response_str = self.message_router.serialize_message(response)
-
-            # Apply outbound failure injection
-            final_message = await self.failure_injector.inject_outbound(
-                response_str, session_id
-            )
-
-            if final_message is not None:
-                # Send response
-                await self.connection_manager.send_to_session(session_id, final_message)
-            else:
-                logger.debug(f"Outbound message dropped for {session_id}")
+        return ws
 
     async def _broadcast_market_data(self) -> None:
-        """Broadcast market data to TICKER subscribers periodically."""
         while self._running:
             try:
-                # Get market data for each symbol
                 for symbol, generator in self.market_data_publisher.generators.items():
-                    # Get current market data
                     market_data = generator.get_market_data_message()
-
-                    # Serialize the message
                     message_str = self.message_router.serialize_message(market_data)
-
-                    # Broadcast to TICKER subscribers for this symbol
                     channel_key = f"TICKER:{symbol}"
-                    await self.connection_manager.broadcast_to_channel(channel_key, message_str)
+                    await self.connection_manager.broadcast_to_channel(
+                        channel_key, message_str
+                    )
 
-                # Wait for tick interval before next update
                 await asyncio.sleep(self.config.exchange.tick_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error broadcasting market data: {e}")
-                await asyncio.sleep(1)  # Brief pause before retry
+                await asyncio.sleep(1)
 
     async def start(self) -> None:
-        """Start the WebSocket server."""
         if self._running:
-            logger.warning("Server is already running")
+            logger.warning("Server already running")
             return
 
         logger.info(f"Starting server on {self.config.server.host}:{self.config.server.port}")
 
-        # Start market data generators
         self.market_data_publisher.start_all()
-
-        # Start market data broadcasting task
         self._running = True
         self._market_data_task = asyncio.create_task(self._broadcast_market_data())
 
-        # Start WebSocket server
-        self._server = await serve(
-            self._handle_client,
-            self.config.server.host,
-            self.config.server.port,
+        self._runner = web.AppRunner(self.app)
+        await self._runner.setup()
+        self._site = web.TCPSite(
+            self._runner, self.config.server.host, self.config.server.port
         )
+        await self._site.start()
 
-        logger.info("Server started successfully")
+        logger.info("Server started")
+        logger.info(f"REST API: http://{self.config.server.host}:{self.config.server.port}/api/v1")
+        logger.info(f"WebSocket: ws://{self.config.server.host}:{self.config.server.port}/ws")
 
     async def stop(self) -> None:
-        """Stop the WebSocket server."""
         if not self._running:
             return
 
         logger.info("Stopping server...")
-
-        # Signal tasks to stop
         self._running = False
 
-        # Stop market data broadcasting task
         if self._market_data_task:
             self._market_data_task.cancel()
             try:
@@ -275,41 +247,33 @@ class ExchangeServer:
             except asyncio.CancelledError:
                 pass
 
-        # Stop market data generators
         await self.market_data_publisher.stop_all()
-
-        # Close all client connections
         await self.connection_manager.close_all()
 
-        # Stop WebSocket server
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+        if self._site:
+            await self._site.stop()
+        if self._runner:
+            await self._runner.cleanup()
 
         logger.info("Server stopped")
 
     async def run_forever(self) -> None:
-        """Start server and run forever."""
         await self.start()
         try:
-            await asyncio.Future()  # Run forever
+            await asyncio.Future()
         except KeyboardInterrupt:
-            logger.info("Received interrupt signal")
+            logger.info("Interrupt received")
         finally:
             await self.stop()
 
 
 async def main() -> None:
-    """Main entry point."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    # Create default configuration
     config = Config()
-
-    # Create and run server
     server = ExchangeServer(config)
     await server.run_forever()
 

@@ -2,10 +2,12 @@
 
 import asyncio
 import uuid
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, TYPE_CHECKING
 from datetime import datetime
-from websockets.server import WebSocketServerProtocol
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from aiohttp.web import WebSocketResponse
 
 
 class SessionState(BaseModel):
@@ -27,11 +29,11 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         """Initialize the connection manager."""
-        self._connections: Dict[str, WebSocketServerProtocol] = {}
+        self._connections: Dict[str, "WebSocketResponse"] = {}
         self._sessions: Dict[str, SessionState] = {}
         self._lock = asyncio.Lock()
 
-    async def add_connection(self, websocket: WebSocketServerProtocol) -> str:
+    async def add_connection(self, websocket: "WebSocketResponse") -> str:
         """Add a new WebSocket connection.
 
         Args:
@@ -63,7 +65,7 @@ class ConnectionManager:
             self._connections.pop(session_id, None)
             self._sessions.pop(session_id, None)
 
-    def get_connection(self, session_id: str) -> Optional[WebSocketServerProtocol]:
+    def get_connection(self, session_id: str) -> Optional["WebSocketResponse"]:
         """Get a WebSocket connection by session ID.
 
         Args:
@@ -155,7 +157,7 @@ class ConnectionManager:
         websocket = self._connections.get(session_id)
         if websocket:
             try:
-                await websocket.send(message)
+                await websocket.send_str(message)
                 return True
             except Exception:
                 # Connection might be closed
@@ -228,7 +230,8 @@ class ConnectionManager:
         websocket = self._connections.get(session_id)
         if websocket:
             try:
-                await websocket.close(code, reason)
+                # aiohttp WebSocketResponse.close() takes code and message (bytes)
+                await websocket.close(code=code, message=reason.encode() if reason else b'')
             except Exception:
                 pass
             finally:
