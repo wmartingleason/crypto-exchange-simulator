@@ -1,0 +1,52 @@
+{
+  "server": {
+    "host": "localhost",
+    "port": 8765,
+    "heartbeat_interval": 30
+  },
+  "exchange": {
+    "symbols": ["BTC/USD", "ETH/USD"],
+    "initial_prices": {
+      "BTC/USD": "50000",
+      "ETH/USD": "3000"
+    },
+    "tick_interval": 0.1,
+    "default_balance": {
+      "USD": "100000",
+      "BTC": "10",
+      "ETH": "100"
+    }
+  },
+  "failures": {
+    "enabled": true,
+    "modes": {
+      "drop_messages": {
+        "enabled": true,
+        "probability": 0.05
+      },
+      "delay_messages": {
+        "enabled": true,
+        "min_ms": 100,
+        "max_ms": 2000
+      },
+      "duplicate_messages": {
+        "enabled": false,
+        "probability": 0.02,
+        "max_duplicates": 2
+      },
+      "reorder_messages": {
+        "enabled": false,
+        "window_size": 5
+      },
+      "corrupt_messages": {
+        "enabled": false,
+        "probability": 0.01,
+        "corruption_level": 0.1
+      },
+      "throttle_messages": {
+        "enabled": false,
+        "max_messages_per_second": 10
+      }
+    }
+  }
+}
