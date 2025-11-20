@@ -5,20 +5,28 @@
     "heartbeat_interval": 30
   },
   "exchange": {
-    "symbols": ["BTC/USD", "ETH/USD"],
+    "symbols": [
+      "BTC/USD",
+      "ETH/USD"
+    ],
     "initial_prices": {
       "BTC/USD": "50000",
       "ETH/USD": "3000"
     },
-    "tick_interval": 0.1,
+    "tick_interval": 0.001,
     "default_balance": {
       "USD": "100000",
       "BTC": "10",
       "ETH": "100"
+    },
+    "pricing_model": {
+      "model_type": "gbm",
+      "drift": 0.10,
+      "volatility": 0.30
     }
   },
   "failures": {
-    "enabled": true,
+    "enabled": false,
     "modes": {
       "drop_messages": {
         "enabled": true,

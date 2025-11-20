@@ -14,6 +14,34 @@ class ServerConfig(BaseModel):
     heartbeat_interval: int = Field(default=30, description="Heartbeat interval in seconds")
 
 
+class PricingModelConfig(BaseModel):
+    """Pricing model configuration.
+
+    For GBM model, drift and volatility should be specified as annualized values.
+    The model will automatically scale these based on the tick_interval to maintain
+    mathematical correctness.
+
+    Example:
+        - drift=0.05 means 5% expected annual return
+        - volatility=0.20 means 20% annual volatility
+        - With tick_interval=1.0 (1 second updates), dt will be 1/(252*24*60*60)
+        - With tick_interval=0.001 (1ms updates), dt will be 0.001/(252*24*60*60)
+    """
+
+    model_type: str = Field(
+        default="gbm",
+        description="Pricing model type: 'gbm' (Geometric Brownian Motion) or 'random_walk'"
+    )
+    drift: float = Field(
+        default=0.0,
+        description="GBM annualized drift parameter (mu). E.g., 0.05 for 5% annual expected return"
+    )
+    volatility: float = Field(
+        default=0.20,
+        description="GBM annualized volatility parameter (sigma). E.g., 0.20 for 20% annual volatility"
+    )
+
+
 class ExchangeConfig(BaseModel):
     """Exchange configuration."""
 
@@ -22,10 +50,17 @@ class ExchangeConfig(BaseModel):
         default={"BTC/USD": "50000"},
         description="Initial prices for symbols",
     )
-    tick_interval: float = Field(default=0.1, description="Market data tick interval")
+    tick_interval: float = Field(
+        default=1.0,
+        description="Market data tick interval in seconds (supports millisecond precision, e.g., 0.001 for 1ms)"
+    )
     default_balance: Dict[str, str] = Field(
         default={"USD": "100000", "BTC": "10"},
         description="Default account balance",
+    )
+    pricing_model: PricingModelConfig = Field(
+        default_factory=PricingModelConfig,
+        description="Pricing model configuration",
     )
 
 

@@ -11,7 +11,7 @@ from .message_router import MessageRouter
 from .failure_injector import FailureInjector
 from .engine.exchange import ExchangeEngine
 from .engine.accounts import AccountManager
-from .market_data.generator import MarketDataGenerator, MarketDataPublisher, RandomWalkModel
+from .market_data.generator import MarketDataGenerator, MarketDataPublisher, RandomWalkModel, GBMPriceModel
 from .handlers.order import OrderHandler
 from .handlers.subscription import SubscriptionHandler
 from .handlers.heartbeat import HeartbeatHandler
@@ -54,6 +54,19 @@ class ExchangeServer:
         # Initialize market data
         self.market_data_publisher = MarketDataPublisher()
         initial_prices = config.get_initial_prices_decimal()
+
+        # Create price model based on configuration
+        pricing_config = config.exchange.pricing_model
+        if pricing_config.model_type == "gbm":
+            price_model = GBMPriceModel(
+                drift=pricing_config.drift,
+                volatility=pricing_config.volatility,
+                tick_interval_seconds=config.exchange.tick_interval,
+            )
+        else:
+            # Fallback to random walk for backward compatibility
+            price_model = RandomWalkModel(volatility=pricing_config.volatility)
+
         for symbol in config.exchange.symbols:
             initial_price = initial_prices.get(symbol)
             if initial_price:
@@ -61,7 +74,7 @@ class ExchangeServer:
                     symbol=symbol,
                     initial_price=initial_price,
                     tick_interval=config.exchange.tick_interval,
-                    price_model=RandomWalkModel(volatility=0.001),
+                    price_model=price_model,
                 )
                 self.market_data_publisher.add_generator(generator)
                 self.exchange_engine.set_last_price(symbol, initial_price)
@@ -77,6 +90,7 @@ class ExchangeServer:
 
         self._server = None
         self._running = False
+        self._market_data_task: Optional[asyncio.Task] = None
 
     def _register_handlers(self) -> None:
         """Register message handlers."""
@@ -195,6 +209,30 @@ class ExchangeServer:
             else:
                 logger.debug(f"Outbound message dropped for {session_id}")
 
+    async def _broadcast_market_data(self) -> None:
+        """Broadcast market data to TICKER subscribers periodically."""
+        while self._running:
+            try:
+                # Get market data for each symbol
+                for symbol, generator in self.market_data_publisher.generators.items():
+                    # Get current market data
+                    market_data = generator.get_market_data_message()
+
+                    # Serialize the message
+                    message_str = self.message_router.serialize_message(market_data)
+
+                    # Broadcast to TICKER subscribers for this symbol
+                    channel_key = f"TICKER:{symbol}"
+                    await self.connection_manager.broadcast_to_channel(channel_key, message_str)
+
+                # Wait for tick interval before next update
+                await asyncio.sleep(self.config.exchange.tick_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error broadcasting market data: {e}")
+                await asyncio.sleep(1)  # Brief pause before retry
+
     async def start(self) -> None:
         """Start the WebSocket server."""
         if self._running:
@@ -206,6 +244,10 @@ class ExchangeServer:
         # Start market data generators
         self.market_data_publisher.start_all()
 
+        # Start market data broadcasting task
+        self._running = True
+        self._market_data_task = asyncio.create_task(self._broadcast_market_data())
+
         # Start WebSocket server
         self._server = await serve(
             self._handle_client,
@@ -213,7 +255,6 @@ class ExchangeServer:
             self.config.server.port,
         )
 
-        self._running = True
         logger.info("Server started successfully")
 
     async def stop(self) -> None:
@@ -222,6 +263,17 @@ class ExchangeServer:
             return
 
         logger.info("Stopping server...")
+
+        # Signal tasks to stop
+        self._running = False
+
+        # Stop market data broadcasting task
+        if self._market_data_task:
+            self._market_data_task.cancel()
+            try:
+                await self._market_data_task
+            except asyncio.CancelledError:
+                pass
 
         # Stop market data generators
         await self.market_data_publisher.stop_all()
@@ -234,7 +286,6 @@ class ExchangeServer:
             self._server.close()
             await self._server.wait_closed()
 
-        self._running = False
         logger.info("Server stopped")
 
     async def run_forever(self) -> None:

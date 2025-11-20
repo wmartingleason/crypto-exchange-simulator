@@ -36,6 +36,11 @@ async def main():
     print("=" * 60)
     print(f"Server: {config.server.host}:{config.server.port}")
     print(f"Symbols: {', '.join(config.exchange.symbols)}")
+    print(f"Tick Interval: {config.exchange.tick_interval}s ({config.exchange.tick_interval * 1000}ms)")
+    print(f"Pricing Model: {config.exchange.pricing_model.model_type.upper()}")
+    if config.exchange.pricing_model.model_type == "gbm":
+        print(f"  - Drift (μ): {config.exchange.pricing_model.drift} (annualized)")
+        print(f"  - Volatility (σ): {config.exchange.pricing_model.volatility} (annualized)")
     print(f"Failure Injection: {'ENABLED' if config.failures.enabled else 'DISABLED'}")
 
     if config.failures.enabled:

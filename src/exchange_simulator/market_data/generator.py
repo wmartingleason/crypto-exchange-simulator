@@ -1,6 +1,7 @@
 """Market data generator for simulating price movements."""
 
 import asyncio
+import math
 import random
 from decimal import Decimal
 from typing import Optional, Dict
@@ -45,22 +46,44 @@ class RandomWalkModel(PriceModel):
 class GBMPriceModel(PriceModel):
     """
     Geometric Brownian Motion (GBM) price model.
-    
+
     Formula: S_t = S_{t-1} * exp((mu - 0.5 * sigma^2) * dt + sigma * sqrt(dt) * Z)
+
+    The drift and volatility parameters should be annualized. The dt parameter
+    represents the time step in years (e.g., 1.0 for yearly, 1/252 for daily,
+    1/(252*24*60*60) for per-second updates with trading days).
     """
 
-    def __init__(self, drift: float = 0.0, volatility: float = 0.1, dt: float = 1.0) -> None:
+    def __init__(
+        self,
+        drift: float = 0.0,
+        volatility: float = 0.1,
+        dt: float = 1.0,
+        tick_interval_seconds: Optional[float] = None
+    ) -> None:
         """Initialize GBM model.
 
         Args:
-            drift (mu): Expected return (e.g., 0.05 for 5% annual growth). 
+            drift (mu): Annualized expected return (e.g., 0.05 for 5% annual growth).
                         Defaults to 0.0 (random walk with no trend).
-            volatility (sigma): Standard deviation of returns (e.g., 0.2 for 20%).
-            dt (delta t): Time step size (e.g., 1/252 for daily steps in a trading year).
+            volatility (sigma): Annualized standard deviation of returns (e.g., 0.2 for 20%).
+            dt (delta t): Time step size in years. If tick_interval_seconds is provided,
+                         this will be automatically calculated. Otherwise defaults to 1.0.
+            tick_interval_seconds: The actual time between ticks in seconds. If provided,
+                                  dt will be calculated as tick_interval_seconds / SECONDS_PER_YEAR.
         """
         self.drift = drift
         self.volatility = volatility
-        self.dt = dt
+
+        # If tick_interval_seconds is provided, calculate dt in years
+        # Using 252 trading days * 24 hours * 60 minutes * 60 seconds
+        if tick_interval_seconds is not None:
+            SECONDS_PER_YEAR = 252 * 24 * 60 * 60  # Trading year
+            self.dt = tick_interval_seconds / SECONDS_PER_YEAR
+            self.tick_interval_seconds = tick_interval_seconds
+        else:
+            self.dt = dt
+            self.tick_interval_seconds = None
 
     def next_price(self, current: Decimal) -> Decimal:
         """Generate next price using Geometric Brownian Motion."""
