@@ -25,6 +25,8 @@ from .failures.strategies import (
     ThrottleMessageStrategy,
     RateLimitStrategy,
     HardcodedVolumeDetector,
+    LatencySimulationStrategy,
+    FailureContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ class ExchangeServer:
         self._site = None
         self._running = False
         self._market_data_task = None
+        self._latency_strategy = None
 
         self.account_manager = AccountManager(config.exchange.default_balance)
         self.exchange_engine = ExchangeEngine(
@@ -82,6 +85,8 @@ class ExchangeServer:
         else:
             self.failure_injector.disable()
 
+        self._configure_latency()
+
         self._register_handlers()
         self._setup_rest_api()
         self.app.router.add_get("/ws", self._handle_websocket)
@@ -96,6 +101,15 @@ class ExchangeServer:
         self.message_router.register_handler(MessageType.GET_ORDERS, order_handler)
         self.message_router.register_handler(MessageType.SUBSCRIBE, subscription_handler)
         self.message_router.register_handler(MessageType.UNSUBSCRIBE, subscription_handler)
+
+    def _configure_latency(self) -> None:
+        latency_config = self.config.failures.latency
+        self._latency_strategy = LatencySimulationStrategy(
+            mu=latency_config.mu,
+            sigma=latency_config.sigma,
+        )
+        self.failure_injector.add_inbound_strategy(self._latency_strategy)
+        self.failure_injector.add_outbound_strategy(self._latency_strategy)
 
     def _configure_failures(self) -> None:
         modes = self.config.failures.modes
@@ -149,6 +163,7 @@ class ExchangeServer:
 
     def _setup_rest_api(self) -> None:
         rate_limiter = None
+
         if self.config.failures.enabled:
             rate_limit_config = self.config.failures.modes.get("rate_limit")
             if rate_limit_config and rate_limit_config.enabled:
@@ -170,6 +185,7 @@ class ExchangeServer:
             self.account_manager,
             self.market_data_publisher,
             rate_limiter=rate_limiter,
+            latency_strategy=self._latency_strategy,
         )
         routes = create_rest_routes(rest_handler)
         self.app.router.add_routes(routes)
@@ -220,6 +236,15 @@ class ExchangeServer:
                     market_data = generator.get_market_data_message()
                     message_str = self.message_router.serialize_message(market_data)
                     channel_key = f"TICKER:{symbol}"
+
+                    if self._latency_strategy:
+                        context = FailureContext(
+                            session_id="broadcast",
+                            message_type="MARKET_DATA",
+                            direction="outbound",
+                        )
+                        await self._latency_strategy.apply(message_str, context)
+
                     await self.connection_manager.broadcast_to_channel(
                         channel_key, message_str
                     )

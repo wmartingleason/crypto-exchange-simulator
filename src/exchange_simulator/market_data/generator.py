@@ -5,7 +5,7 @@ import math
 import random
 from decimal import Decimal
 from typing import Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..models.messages import MarketDataMessage, TradeMessage
 from ..models.orders import OrderSide
@@ -154,7 +154,7 @@ class MarketDataGenerator:
         self.high_24h = initial_price
         self.low_24h = initial_price
         self.volume_24h = Decimal("0")
-        self.last_update = datetime.utcnow()
+        self.last_update = datetime.now(timezone.utc)
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -192,7 +192,7 @@ class MarketDataGenerator:
         if new_price < self.low_24h:
             self.low_24h = new_price
 
-        self.last_update = datetime.utcnow()
+        self.last_update = datetime.now(timezone.utc)
 
     def get_current_price(self) -> Decimal:
         """Get current price.
@@ -209,7 +209,7 @@ class MarketDataGenerator:
             price: New price
         """
         self.current_price = price
-        self.last_update = datetime.utcnow()
+        self.last_update = datetime.now(timezone.utc)
 
     def get_market_data_message(self) -> MarketDataMessage:
         """Generate a market data message.
@@ -253,7 +253,7 @@ class MarketDataGenerator:
         self.volume_24h += quantity
 
         return TradeMessage(
-            trade_id=f"TRADE_{datetime.utcnow().timestamp()}",
+            trade_id=f"TRADE_{datetime.now(timezone.utc).timestamp()}",
             symbol=self.symbol,
             price=trade_price,
             quantity=quantity,

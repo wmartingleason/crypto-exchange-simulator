@@ -277,29 +277,39 @@ class TradingDashboard:
                                 break
 
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                data = json.loads(msg.data)
-                                self.health.ws_message_received()
+                                try:
+                                    data = json.loads(msg.data)
+                                    self.health.ws_message_received()
 
-                                if data.get("type") == "MARKET_DATA":
-                                    timestamp = datetime.fromisoformat(
-                                        data["timestamp"].replace("Z", "+00:00")
-                                    )
-                                    price = float(data["last_price"])
-                                    # Use a small volume increment per tick since we don't have actual trade volume
-                                    # This is for visualization purposes only
-                                    tick_volume = 0.01
-                                    
-                                    self.market_data.add(
-                                        timestamp,
-                                        price,
-                                        float(data["bid"]),
-                                        float(data["ask"]),
-                                        float(data["volume_24h"]),
-                                        data["symbol"],
-                                    )
-                                    
-                                    # Add tick to candlestick aggregator
-                                    self.candlestick_aggregator.add_tick(timestamp, price, tick_volume)
+                                    if data.get("type") == "MARKET_DATA":
+                                        # Parse timestamp - handle both with and without timezone
+                                        ts_str = data["timestamp"]
+                                        if "Z" in ts_str:
+                                            ts_str = ts_str.replace("Z", "+00:00")
+                                        elif "+" not in ts_str and ts_str.count("-") <= 2:
+                                            # Naive datetime - assume UTC
+                                            ts_str = ts_str + "+00:00"
+                                        timestamp = datetime.fromisoformat(ts_str)
+                                        price = float(data["last_price"])
+                                        # Use a small volume increment per tick since we don't have actual trade volume
+                                        # This is for visualization purposes only
+                                        tick_volume = 0.01
+                                        
+                                        self.market_data.add(
+                                            timestamp,
+                                            price,
+                                            float(data["bid"]),
+                                            float(data["ask"]),
+                                            float(data["volume_24h"]),
+                                            data["symbol"],
+                                        )
+                                        
+                                        # Add tick to candlestick aggregator
+                                        self.candlestick_aggregator.add_tick(timestamp, price, tick_volume)
+                                except Exception as e:
+                                    print(f"Error processing WebSocket message: {e}")
+                                    import traceback
+                                    traceback.print_exc()
                             elif msg.type == aiohttp.WSMsgType.CLOSED:
                                 self.health.ws_disconnected()
                                 break

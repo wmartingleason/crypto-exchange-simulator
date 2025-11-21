@@ -3,7 +3,7 @@
 import asyncio
 import uuid
 from typing import Dict, Optional, Set, TYPE_CHECKING
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
@@ -44,7 +44,7 @@ class ConnectionManager:
         """
         async with self._lock:
             session_id = str(uuid.uuid4())
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             self._connections[session_id] = websocket
             self._sessions[session_id] = SessionState(
@@ -95,7 +95,7 @@ class ConnectionManager:
         """
         session = self._sessions.get(session_id)
         if session:
-            session.last_activity = datetime.utcnow()
+            session.last_activity = datetime.now(timezone.utc)
 
     async def add_subscription(self, session_id: str, channel: str) -> bool:
         """Add a subscription to a session.

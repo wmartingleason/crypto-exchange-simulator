@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Optional, Any, Dict, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 
 from .orders import OrderSide, OrderType, OrderStatus, TimeInForce
@@ -51,7 +51,7 @@ class Message(BaseModel):
 
     type: MessageType = Field(..., description="Message type")
     request_id: Optional[str] = Field(None, description="Request ID for correlation")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Message timestamp")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Message timestamp")
 
 
 # Client -> Server Messages

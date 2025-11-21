@@ -3,6 +3,7 @@
 import asyncio
 import random
 import time
+import numpy as np
 from abc import ABC, abstractmethod
 from typing import Optional, Any, Dict
 from collections import deque
@@ -492,4 +493,38 @@ class RateLimitStrategy(FailureStrategy):
             "rate_limited_count": self.rate_limited_count,
             "banned_sessions": len(self._permanent_bans) + len(self._session_bans),
             "permanent_bans": len(self._permanent_bans),
+        }
+
+
+class LatencySimulationStrategy(FailureStrategy):
+    """Strategy that simulates network latency using log-normal distribution."""
+
+    def __init__(self, mu: float = 5.0, sigma: float = 0.3) -> None:
+        if sigma <= 0:
+            raise ValueError("sigma must be positive")
+        self.mu = mu
+        self.sigma = sigma
+        self.total_delay_seconds = 0.0
+        self.delayed_count = 0
+
+    async def apply(self, message: str, context: FailureContext) -> Optional[str]:
+        delay_ms = np.random.lognormal(self.mu, self.sigma)
+        delay_seconds = delay_ms / 1000.0
+        self.total_delay_seconds += delay_seconds
+        self.delayed_count += 1
+        await asyncio.sleep(delay_seconds)
+        return message
+
+    def reset(self) -> None:
+        self.total_delay_seconds = 0.0
+        self.delayed_count = 0
+
+    def get_stats(self) -> Dict[str, Any]:
+        avg_delay = (
+            self.total_delay_seconds / self.delayed_count if self.delayed_count > 0 else 0
+        )
+        return {
+            "delayed_count": self.delayed_count,
+            "total_delay_seconds": self.total_delay_seconds,
+            "average_delay_seconds": avg_delay,
         }

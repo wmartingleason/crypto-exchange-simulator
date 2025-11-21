@@ -77,10 +77,37 @@ class FailureMode(BaseModel):
     corruption_level: Optional[float] = Field(None, description="Corruption level")
 
 
+class LatencyConfig(BaseModel):
+    """Latency simulation configuration."""
+
+    mode: str = Field(
+        default="typical",
+        description="Latency mode: 'stable' or 'typical'",
+    )
+
+    @property
+    def mu(self) -> float:
+        """Get mu parameter for log-normal distribution."""
+        if self.mode == "stable":
+            return 3.8
+        return 5.0
+
+    @property
+    def sigma(self) -> float:
+        """Get sigma parameter for log-normal distribution."""
+        if self.mode == "stable":
+            return 0.2
+        return 0.3
+
+
 class FailuresConfig(BaseModel):
     """Failures configuration."""
 
     enabled: bool = Field(default=False, description="Enable failure injection")
+    latency: LatencyConfig = Field(
+        default_factory=LatencyConfig,
+        description="Latency simulation configuration",
+    )
     modes: Dict[str, FailureMode] = Field(
         default={},
         description="Failure modes configuration",

@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Optional
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -53,8 +53,8 @@ class Order(BaseModel):
     filled_quantity: Decimal = Field(default=Decimal("0"), ge=0, description="Filled quantity")
     status: OrderStatus = Field(default=OrderStatus.PENDING, description="Order status")
     time_in_force: TimeInForce = Field(default=TimeInForce.GTC, description="Time in force")
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Creation timestamp")
-    updated_at: datetime = Field(default_factory=datetime.utcnow, description="Last update timestamp")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Creation timestamp")
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Last update timestamp")
 
     @model_validator(mode='after')
     def validate_order(self) -> 'Order':
@@ -90,7 +90,7 @@ class Order(BaseModel):
             raise ValueError("Fill quantity exceeds remaining quantity")
 
         self.filled_quantity += quantity
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
 
         if self.is_filled:
             self.status = OrderStatus.FILLED
@@ -102,12 +102,12 @@ class Order(BaseModel):
         if self.status in (OrderStatus.FILLED, OrderStatus.CANCELLED):
             raise ValueError(f"Cannot cancel order with status {self.status}")
         self.status = OrderStatus.CANCELLED
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
 
     def reject(self) -> None:
         """Reject the order."""
         self.status = OrderStatus.REJECTED
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
 
 
 class Fill(BaseModel):
@@ -120,7 +120,7 @@ class Fill(BaseModel):
     side: OrderSide = Field(..., description="Buy or sell")
     price: Decimal = Field(..., gt=0, description="Execution price")
     quantity: Decimal = Field(..., gt=0, description="Filled quantity")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Execution timestamp")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Execution timestamp")
     is_maker: bool = Field(default=False, description="True if maker, False if taker")
 
 

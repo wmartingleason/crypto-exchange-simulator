@@ -19,6 +19,7 @@ Test systems against realistic infrastructure failures:
 - Message corruption
 - Rate throttling
 - REST API rate limiting with escalating penalties
+- Network latency simulation with log-normal distribution (stable/typical link modes)
 
 ### Market Data
 - Geometric Brownian Motion (GBM) price model (placeholder)
@@ -147,6 +148,9 @@ Create `config.json` in your working directory:
   },
   "failures": {
     "enabled": true,
+    "latency": {
+      "mode": "typical"
+    },
     "modes": {
       "drop_messages": {
         "enabled": true,
@@ -203,6 +207,18 @@ Rate-limited requests return HTTP 429 with `Retry-After` header:
   "violation_count": 1
 }
 ```
+
+### Latency Simulation
+
+Network latency is simulated using log-normal distribution for packet interarrival times. Latency is applied independently to:
+- Incoming packets (before processing)
+- Outgoing packets (before sending)
+
+Two latency modes are available:
+- **Stable link**: μ=3.8, σ=0.2 (more reliable connection, EV: ~46ms)
+- **Typical link**: μ=5.0, σ=0.3 (typical network conditions, EV: ~155ms)
+
+Configure via `failures.latency.mode` in config.json. Latency simulation runs automatically for all WebSocket and REST API traffic.
 
 Quick example:
 
