@@ -3,7 +3,7 @@
 import asyncio
 import json
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 from threading import Thread, Lock
 import plotly.graph_objs as go
@@ -131,6 +131,119 @@ class ConnectionHealth:
             }
 
 
+class CandlestickAggregator:
+    """Thread-safe aggregator for converting tick data into OHLCV candlesticks."""
+
+    def __init__(self, interval_seconds: int = 1, max_candles: int = 1000):
+        """Initialize candlestick aggregator.
+
+        Args:
+            interval_seconds: Time interval for each candle in seconds
+            max_candles: Maximum number of candles to store
+        """
+        self.interval_seconds = interval_seconds
+        self.max_candles = max_candles
+        self.lock = Lock()
+        
+        # Current candle being built
+        self.current_candle_start = None
+        self.current_candle_open = None
+        self.current_candle_high = None
+        self.current_candle_low = None
+        self.current_candle_close = None
+        self.current_candle_volume = 0.0
+        
+        # Completed candles
+        self.candles = deque(maxlen=max_candles)
+
+    def _get_candle_start(self, timestamp: datetime) -> datetime:
+        """Get the start timestamp for the candle containing this timestamp."""
+        if self.interval_seconds == 1:
+            # For 1 second intervals, round down to the second
+            return timestamp.replace(microsecond=0)
+        else:
+            # For longer intervals, round down to the interval boundary
+            total_seconds = int(timestamp.timestamp())
+            interval_start = (total_seconds // self.interval_seconds) * self.interval_seconds
+            return datetime.fromtimestamp(interval_start, tz=timestamp.tzinfo)
+
+    def add_tick(self, timestamp: datetime, price: float, volume: float) -> list:
+        """Add a tick and return any completed candles.
+
+        Args:
+            timestamp: Timestamp of the tick
+            price: Price of the tick
+            volume: Volume of the tick
+
+        Returns:
+            List of completed candle dictionaries (empty if none completed)
+        """
+        with self.lock:
+            candle_start = self._get_candle_start(timestamp)
+            completed_candles = []
+
+            # If we're starting a new candle
+            if self.current_candle_start is None or candle_start > self.current_candle_start:
+                # If we had a previous candle, finalize it
+                if self.current_candle_start is not None:
+                    completed_candles.append({
+                        "timestamp": self.current_candle_start,
+                        "open": self.current_candle_open,
+                        "high": self.current_candle_high,
+                        "low": self.current_candle_low,
+                        "close": self.current_candle_close,
+                        "volume": self.current_candle_volume,
+                    })
+                    self.candles.append(completed_candles[-1])
+
+                # Start new candle
+                self.current_candle_start = candle_start
+                self.current_candle_open = price
+                self.current_candle_high = price
+                self.current_candle_low = price
+                self.current_candle_close = price
+                self.current_candle_volume = volume
+            else:
+                # Update current candle
+                self.current_candle_high = max(self.current_candle_high, price)
+                self.current_candle_low = min(self.current_candle_low, price)
+                self.current_candle_close = price
+                self.current_candle_volume += volume
+
+            return completed_candles
+
+    def get_candles(self, max_candles: int = None) -> list:
+        """Get recent candles for display.
+
+        Args:
+            max_candles: Maximum number of candles to return
+
+        Returns:
+            List of candle dictionaries
+        """
+        with self.lock:
+            candles = list(self.candles)
+            if max_candles and len(candles) > max_candles:
+                return candles[-max_candles:]
+            return candles
+
+    def set_interval(self, interval_seconds: int) -> None:
+        """Change the interval and clear existing data.
+
+        Args:
+            interval_seconds: New interval in seconds
+        """
+        with self.lock:
+            self.interval_seconds = interval_seconds
+            self.candles.clear()
+            self.current_candle_start = None
+            self.current_candle_open = None
+            self.current_candle_high = None
+            self.current_candle_low = None
+            self.current_candle_close = None
+            self.current_candle_volume = 0.0
+
+
 class TradingDashboard:
     """Trading dashboard with integrated market data and account management."""
 
@@ -142,6 +255,8 @@ class TradingDashboard:
         self.market_data = MarketDataBuffer()
         self.account = AccountState()
         self.health = ConnectionHealth()
+        self.candlestick_aggregator = CandlestickAggregator(interval_seconds=1)
+        self.current_interval = 1
         self.running = False
 
     async def start_websocket(self):
@@ -169,14 +284,22 @@ class TradingDashboard:
                                     timestamp = datetime.fromisoformat(
                                         data["timestamp"].replace("Z", "+00:00")
                                     )
+                                    price = float(data["last_price"])
+                                    # Use a small volume increment per tick since we don't have actual trade volume
+                                    # This is for visualization purposes only
+                                    tick_volume = 0.01
+                                    
                                     self.market_data.add(
                                         timestamp,
-                                        float(data["last_price"]),
+                                        price,
                                         float(data["bid"]),
                                         float(data["ask"]),
                                         float(data["volume_24h"]),
                                         data["symbol"],
                                     )
+                                    
+                                    # Add tick to candlestick aggregator
+                                    self.candlestick_aggregator.add_tick(timestamp, price, tick_volume)
                             elif msg.type == aiohttp.WSMsgType.CLOSED:
                                 self.health.ws_disconnected()
                                 break
@@ -243,6 +366,19 @@ class TradingDashboard:
                 html.Div([
                     html.H3("Market Data"),
                     html.Div(id="market-info"),
+                    html.Div([
+                        html.Label("Candlestick Interval: ", style={"marginRight": "10px", "fontWeight": "bold"}),
+                        dcc.Dropdown(
+                            id="candle-interval-selector",
+                            options=[
+                                {"label": "1 second", "value": 1},
+                                {"label": "15 minutes", "value": 900},
+                            ],
+                            value=1,
+                            clearable=False,
+                            style={"width": "200px", "display": "inline-block"},
+                        ),
+                    ], style={"marginBottom": "10px", "marginTop": "10px"}),
                     dcc.Graph(id="price-chart", config={"displayModeBar": False}),
                     dcc.Graph(id="spread-chart", config={"displayModeBar": False}),
                 ], style={"width": "70%", "display": "inline-block", "vertical-align": "top", "padding": "10px"}),
@@ -306,42 +442,69 @@ class TradingDashboard:
 
         @app.callback(
             Output("price-chart", "figure"),
-            Input("update-interval", "n_intervals"),
+            [Input("update-interval", "n_intervals"),
+             Input("candle-interval-selector", "value")],
         )
-        def update_price_chart(n):
-            data = self.market_data.get(max_points=1000)
+        def update_price_chart(n, interval_value):
+            # Handle interval changes
+            if interval_value and interval_value != self.current_interval:
+                self.candlestick_aggregator.set_interval(interval_value)
+                self.current_interval = interval_value
 
-            if not data["prices"]:
+            # Get exactly 120 most recent candles (or all if less than 120)
+            candles = self.candlestick_aggregator.get_candles(max_candles=120)
+            data = self.market_data.get()
+
+            if not candles:
                 return {"data": [], "layout": go.Layout(title="Price Movement", template="plotly_white")}
+
+            # Extract OHLCV data from candles
+            timestamps = [c["timestamp"] for c in candles]
+            opens = [c["open"] for c in candles]
+            highs = [c["high"] for c in candles]
+            lows = [c["low"] for c in candles]
+            closes = [c["close"] for c in candles]
+
+            # Calculate x-axis range to show exactly 120 candles worth of time
+            # Use the current interval to determine the time span
+            if len(candles) > 0:
+                # Calculate the time span for 120 candles
+                time_span_seconds = 120 * self.current_interval
+                # Start from the first candle's timestamp
+                xaxis_start = timestamps[0]
+                # End at first timestamp + time span (with small padding for better visualization)
+                xaxis_end = xaxis_start + timedelta(seconds=time_span_seconds + self.current_interval)
+                
+                xaxis_range = [xaxis_start, xaxis_end]
+            else:
+                xaxis_range = None
 
             return {
                 "data": [
-                    go.Scatter(
-                        x=data["timestamps"],
-                        y=data["prices"],
-                        mode="lines",
-                        name="Last",
-                        line={"color": "#2980b9", "width": 2},
-                    ),
-                    go.Scatter(
-                        x=data["timestamps"],
-                        y=data["bids"],
-                        mode="lines",
-                        name="Bid",
-                        line={"color": "#27ae60", "width": 1},
-                    ),
-                    go.Scatter(
-                        x=data["timestamps"],
-                        y=data["asks"],
-                        mode="lines",
-                        name="Ask",
-                        line={"color": "#e74c3c", "width": 1},
+                    go.Candlestick(
+                        x=timestamps,
+                        open=opens,
+                        high=highs,
+                        low=lows,
+                        close=closes,
+                        name="Price",
+                        increasing_line_color="#27ae60",
+                        decreasing_line_color="#e74c3c",
+                        increasing_fillcolor="#27ae60",
+                        decreasing_fillcolor="#e74c3c",
                     ),
                 ],
                 "layout": go.Layout(
-                    title=f"{data['symbol']} Price",
-                    xaxis={"title": "Time"},
-                    yaxis={"title": "Price (USD)"},
+                    title=f"{data.get('symbol', 'Unknown')} Price - Candlestick Chart",
+                    xaxis={
+                        "title": "Time",
+                        "range": xaxis_range,
+                        "fixedrange": True,  # Prevent zoom/pan on x-axis
+                    },
+                    yaxis={
+                        "title": "Price (USD)",
+                        # y-axis remains dynamic (auto-scaling)
+                    },
                     template="plotly_white",
                     hovermode="x unified",
                     height=350,
@@ -351,15 +514,34 @@ class TradingDashboard:
 
         @app.callback(
             Output("spread-chart", "figure"),
-            Input("update-interval", "n_intervals"),
+            [Input("update-interval", "n_intervals"),
+             Input("candle-interval-selector", "value")],
         )
-        def update_spread_chart(n):
+        def update_spread_chart(n, interval_value):
             data = self.market_data.get(max_points=1000)
 
             if not data["prices"]:
                 return {"data": [], "layout": go.Layout(title="Bid-Ask Spread", template="plotly_white")}
 
             spreads = [ask - bid for bid, ask in zip(data["bids"], data["asks"])]
+
+            # Calculate the same x-axis range as the price chart (120 candles worth of time)
+            # Get the candles to determine the exact time window used in the price chart
+            candles = self.candlestick_aggregator.get_candles(max_candles=120)
+            if len(candles) > 0:
+                # Use the same calculation as the price chart
+                time_span_seconds = 120 * self.current_interval
+                xaxis_start = candles[0]["timestamp"]
+                xaxis_end = xaxis_start + timedelta(seconds=time_span_seconds + self.current_interval)
+                xaxis_range = [xaxis_start, xaxis_end]
+            elif len(data["timestamps"]) > 0:
+                # Fallback: calculate from tick data if no candles yet
+                time_span_seconds = 120 * self.current_interval
+                xaxis_end = data["timestamps"][-1]
+                xaxis_start = xaxis_end - timedelta(seconds=time_span_seconds)
+                xaxis_range = [xaxis_start, xaxis_end]
+            else:
+                xaxis_range = None
 
             return {
                 "data": [
@@ -373,7 +555,11 @@ class TradingDashboard:
                 ],
                 "layout": go.Layout(
                     title="Bid-Ask Spread",
-                    xaxis={"title": "Time"},
+                    xaxis={
+                        "title": "Time",
+                        "range": xaxis_range,
+                        "fixedrange": True,  # Prevent zoom/pan on x-axis, keep in sync with price chart
+                    },
                     yaxis={"title": "Spread (USD)"},
                     template="plotly_white",
                     height=250,

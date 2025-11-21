@@ -51,7 +51,7 @@ class ExchangeConfig(BaseModel):
         description="Initial prices for symbols",
     )
     tick_interval: float = Field(
-        default=1.0,
+        default=0.001,
         description="Market data tick interval in seconds (supports millisecond precision, e.g., 0.001 for 1ms)"
     )
     default_balance: Dict[str, str] = Field(
