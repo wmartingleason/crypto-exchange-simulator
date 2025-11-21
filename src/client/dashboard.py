@@ -170,13 +170,14 @@ class CandlestickAggregator:
             interval_start = (total_seconds // self.interval_seconds) * self.interval_seconds
             return datetime.fromtimestamp(interval_start, tz=timestamp.tzinfo)
 
-    def add_tick(self, timestamp: datetime, price: float, volume: float) -> list:
+    def add_tick(self, timestamp: datetime, price: float, volume: float, source: str = "unknown") -> list:
         """Add a tick and return any completed candles.
 
         Args:
             timestamp: Timestamp of the tick
             price: Price of the tick
             volume: Volume of the tick
+            source: Source of the tick (for debugging)
 
         Returns:
             List of completed candle dictionaries (empty if none completed)
@@ -199,6 +200,17 @@ class CandlestickAggregator:
                     })
                     self.candles.append(completed_candles[-1])
 
+                    # Log completed candle info
+                    if logging.getLogger(__name__).isEnabledFor(logging.DEBUG):
+                        candle = completed_candles[-1]
+                        spread = candle["high"] - candle["low"]
+                        body = abs(candle["close"] - candle["open"])
+                        logging.getLogger(__name__).debug(
+                            "Completed candle at %s: O=%.2f H=%.2f L=%.2f C=%.2f (spread=%.2f, body=%.2f, ticks=%.0f)",
+                            candle["timestamp"], candle["open"], candle["high"],
+                            candle["low"], candle["close"], spread, body, candle["volume"] / 0.01
+                        )
+
                 # Start new candle
                 self.current_candle_start = candle_start
                 self.current_candle_open = price
@@ -206,6 +218,11 @@ class CandlestickAggregator:
                 self.current_candle_low = price
                 self.current_candle_close = price
                 self.current_candle_volume = volume
+
+                logging.getLogger(__name__).debug(
+                    "Started new candle at %s from %s: price=%.2f",
+                    candle_start, source, price
+                )
             else:
                 # Update current candle
                 self.current_candle_high = max(self.current_candle_high, price)
@@ -268,6 +285,10 @@ class TradingDashboard:
         self.running = False
         self.logger = logging.getLogger(__name__)
 
+        # Track the latest timestamp we've processed from ANY source (REST or WS)
+        # to avoid processing duplicate data when WS sends backlog after reconnection
+        self._latest_processed_timestamp: Optional[datetime] = None
+
         # Initialize network manager
         from .network.network_manager import NetworkManager
         from .config import ClientConfig
@@ -291,7 +312,17 @@ class TradingDashboard:
                 if timestamp is None:
                     self.logger.warning("Received market data with invalid timestamp: %s", data.get("timestamp"))
                     return
+
                 price = float(data["last_price"])
+
+                # Skip if we've already processed this timestamp from any source
+                if self._latest_processed_timestamp is not None and timestamp <= self._latest_processed_timestamp:
+                    self.logger.debug(
+                        "Skipping WS tick at %s (already processed up to %s)",
+                        timestamp, self._latest_processed_timestamp
+                    )
+                    return
+
                 # Use a small volume increment per tick since we don't have actual trade volume
                 # This is for visualization purposes only
                 tick_volume = 0.01
@@ -306,7 +337,10 @@ class TradingDashboard:
                 )
 
                 # Add tick to candlestick aggregator
-                self.candlestick_aggregator.add_tick(timestamp, price, tick_volume)
+                self.candlestick_aggregator.add_tick(timestamp, price, tick_volume, source="WS")
+
+                # Update latest processed timestamp
+                self._latest_processed_timestamp = timestamp
         except Exception as e:
             print(f"Error processing WebSocket message: {e}")
             import traceback
@@ -350,12 +384,24 @@ class TradingDashboard:
                     if not timestamp:
                         self.logger.warning("Skipping price history entry with invalid timestamp")
                         continue
+
+                    # Skip if we've already processed this timestamp
+                    if self._latest_processed_timestamp is not None and timestamp <= self._latest_processed_timestamp:
+                        self.logger.debug(
+                            "Skipping REST tick at %s (already processed up to %s)",
+                            timestamp, self._latest_processed_timestamp
+                        )
+                        continue
+
                     price = float(point.get("price", 0))
                     bid = float(point.get("bid", 0))
                     ask = float(point.get("ask", 0))
                     volume = float(point.get("volume_24h", 0))
                     self.market_data.add(timestamp, price, bid, ask, volume, symbol)
-                    self.candlestick_aggregator.add_tick(timestamp, price, 0.01)
+                    self.candlestick_aggregator.add_tick(timestamp, price, 0.01, source="REST")
+
+                    # Update latest processed timestamp
+                    self._latest_processed_timestamp = timestamp
         elif recon_type == "orders":
             # Orders were reconciled
             self.account.update_orders(data)
