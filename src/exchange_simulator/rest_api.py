@@ -11,6 +11,7 @@ from .engine.accounts import AccountManager
 from .market_data.generator import MarketDataPublisher
 from .models.orders import OrderSide, OrderType, OrderStatus, TimeInForce
 from .models.messages import PlaceOrderMessage, CancelOrderMessage
+from .failures.strategies import RateLimitStrategy, FailureContext
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,44 @@ class DecimalEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+class RateLimiter:
+    """Rate limiter middleware for REST API requests."""
+
+    def __init__(self, rate_limit_strategy: Optional[RateLimitStrategy] = None) -> None:
+        self.rate_limit_strategy = rate_limit_strategy
+
+    async def check_rate_limit(self, session_id: str, request_path: str = "") -> None:
+        if not self.rate_limit_strategy:
+            return
+
+        context = FailureContext(
+            session_id=session_id,
+            message_type="REST_REQUEST",
+            direction="inbound",
+            metadata={"path": request_path},
+        )
+
+        result = await self.rate_limit_strategy.apply("", context)
+
+        if result is None:
+            error_msg = context.metadata.get("rate_limit_error", "Rate limit exceeded")
+            retry_after = context.metadata.get("retry_after")
+            violation_count = self.rate_limit_strategy.get_violation_count(session_id)
+
+            response_data = {
+                "error": error_msg,
+                "violation_count": violation_count,
+            }
+            if retry_after is not None:
+                response_data["retry_after"] = retry_after
+
+            raise web.HTTPTooManyRequests(
+                text=json.dumps(response_data),
+                headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
+                content_type="application/json",
+            )
+
+
 class RestAPIHandler:
     """REST API request handlers."""
 
@@ -32,17 +71,17 @@ class RestAPIHandler:
         exchange_engine: ExchangeEngine,
         account_manager: AccountManager,
         market_data_publisher: MarketDataPublisher,
+        rate_limiter: Optional[RateLimiter] = None,
     ):
-        """Initialize REST API handler.
-
-        Args:
-            exchange_engine: Exchange engine instance
-            account_manager: Account manager instance
-            market_data_publisher: Market data publisher instance
-        """
         self.exchange_engine = exchange_engine
         self.account_manager = account_manager
         self.market_data_publisher = market_data_publisher
+        self.rate_limiter = rate_limiter
+
+    async def _check_rate_limit(self, request: web.Request) -> None:
+        if self.rate_limiter:
+            session_id = request.headers.get("X-Session-ID", "rest-session")
+            await self.rate_limiter.check_rate_limit(session_id, request.path)
 
     async def health_check(self, request: web.Request) -> web.Response:
         """Health check endpoint.
@@ -56,6 +95,7 @@ class RestAPIHandler:
 
         GET /api/v1/symbols
         """
+        await self._check_rate_limit(request)
         symbols = list(self.exchange_engine.symbols)
         return web.json_response({"symbols": symbols})
 
@@ -64,6 +104,7 @@ class RestAPIHandler:
 
         GET /api/v1/ticker?symbol=BTC/USD
         """
+        await self._check_rate_limit(request)
         symbol = request.query.get("symbol")
         if not symbol:
             return web.json_response(
@@ -103,6 +144,8 @@ class RestAPIHandler:
             "time_in_force": "GTC" | "IOC" | "FOK"  // Optional, defaults to GTC
         }
         """
+        await self._check_rate_limit(request)
+
         try:
             data = await request.json()
         except json.JSONDecodeError:
@@ -171,6 +214,7 @@ class RestAPIHandler:
 
         DELETE /api/v1/orders/{order_id}
         """
+        await self._check_rate_limit(request)
         order_id = request.match_info.get("order_id")
         if not order_id:
             return web.json_response({"error": "order_id required"}, status=400)
@@ -199,6 +243,7 @@ class RestAPIHandler:
 
         GET /api/v1/orders/{order_id}
         """
+        await self._check_rate_limit(request)
         order_id = request.match_info.get("order_id")
         if not order_id:
             return web.json_response({"error": "order_id required"}, status=400)
@@ -229,6 +274,7 @@ class RestAPIHandler:
 
         GET /api/v1/orders?symbol=BTC/USD&status=OPEN
         """
+        await self._check_rate_limit(request)
         session_id = request.headers.get("X-Session-ID", "rest-session")
         symbol = request.query.get("symbol")
         status = request.query.get("status")
@@ -260,6 +306,7 @@ class RestAPIHandler:
 
         GET /api/v1/balance
         """
+        await self._check_rate_limit(request)
         session_id = request.headers.get("X-Session-ID", "rest-session")
 
         account = self.account_manager.get_or_create_account(session_id)
@@ -277,6 +324,7 @@ class RestAPIHandler:
 
         GET /api/v1/position?symbol=BTC/USD
         """
+        await self._check_rate_limit(request)
         session_id = request.headers.get("X-Session-ID", "rest-session")
         symbol = request.query.get("symbol")
 

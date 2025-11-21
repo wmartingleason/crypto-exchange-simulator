@@ -2,9 +2,11 @@
 
 import asyncio
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Optional, Any, Dict
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 
 
@@ -324,3 +326,170 @@ class ThrottleMessageStrategy(FailureStrategy):
     def get_stats(self) -> Dict[str, int]:
         """Get statistics about throttling."""
         return {"throttled_count": self.throttled_count}
+
+
+class VolumeDetector(ABC):
+    """Abstract base class for detecting high volume periods."""
+
+    @abstractmethod
+    def is_high_volume(self) -> bool:
+        """Check if currently in a high volume period."""
+        pass
+
+    @abstractmethod
+    def get_volume_multiplier(self) -> float:
+        """Get the multiplier for rate limits during current period."""
+        pass
+
+
+class HardcodedVolumeDetector(VolumeDetector):
+    """Hardcoded volume detector for testing and simulation."""
+
+    def __init__(self, high_volume: bool = False, volume_multiplier: float = 0.5) -> None:
+        self._high_volume = high_volume
+        self.volume_multiplier = volume_multiplier
+
+    def is_high_volume(self) -> bool:
+        return self._high_volume
+
+    def get_volume_multiplier(self) -> float:
+        return self.volume_multiplier if self._high_volume else 1.0
+
+    def set_high_volume(self, high_volume: bool) -> None:
+        self._high_volume = high_volume
+
+
+class RateLimitStrategy(FailureStrategy):
+    """Strategy that rate limits requests with escalating penalties."""
+
+    def __init__(
+        self,
+        baseline_rps: int = 10,
+        wait_period_seconds: int = 10,
+        second_violation_ban_seconds: int = 60,
+        violation_window_seconds: int = 60,
+        volume_detector: Optional[VolumeDetector] = None,
+    ) -> None:
+        if baseline_rps < 1:
+            raise ValueError("baseline_rps must be at least 1")
+        if wait_period_seconds < 0:
+            raise ValueError("wait_period_seconds must be non-negative")
+        if second_violation_ban_seconds < 0:
+            raise ValueError("second_violation_ban_seconds must be non-negative")
+
+        self.baseline_rps = baseline_rps
+        self.wait_period_seconds = wait_period_seconds
+        self.second_violation_ban_seconds = second_violation_ban_seconds
+        self.violation_window_seconds = violation_window_seconds
+        self.volume_detector = volume_detector or HardcodedVolumeDetector()
+
+        self._session_requests: Dict[str, deque] = {}
+        self._session_violations: Dict[str, list] = {}
+        self._session_bans: Dict[str, Optional[datetime]] = {}
+        self._permanent_bans: set[str] = set()
+        self._lock = asyncio.Lock()
+        self.rate_limited_count = 0
+
+    def _get_current_limit(self) -> int:
+        multiplier = self.volume_detector.get_volume_multiplier()
+        return max(1, int(self.baseline_rps * multiplier))
+
+    async def _check_rate_limit(self, session_id: str) -> tuple[bool, Optional[str], Optional[int]]:
+        async with self._lock:
+            current_time = datetime.now(timezone.utc)
+
+            if session_id in self._permanent_bans:
+                return False, "Account permanently banned due to repeated rate limit violations", None
+
+            ban_expiry = self._session_bans.get(session_id)
+            if ban_expiry and ban_expiry > current_time:
+                retry_after = int((ban_expiry - current_time).total_seconds()) + 1
+                return False, "Rate limit exceeded. Account temporarily banned", retry_after
+
+            if ban_expiry and ban_expiry <= current_time:
+                del self._session_bans[session_id]
+
+            current_limit = self._get_current_limit()
+
+            if session_id not in self._session_requests:
+                self._session_requests[session_id] = deque(maxlen=current_limit * 2)
+                self._session_violations[session_id] = []
+
+            request_times = self._session_requests[session_id]
+            one_second_ago = current_time - timedelta(seconds=1)
+            while request_times and request_times[0] < one_second_ago:
+                request_times.popleft()
+
+            if len(request_times) >= current_limit:
+                self._session_violations[session_id].append(current_time)
+                violations = self._session_violations[session_id]
+
+                window_start = current_time - timedelta(seconds=self.violation_window_seconds)
+                violations[:] = [v for v in violations if v > window_start]
+
+                violation_count = len(violations)
+                if violation_count >= 3:
+                    self._permanent_bans.add(session_id)
+                    return False, "Account permanently banned due to repeated rate limit violations", None
+                elif violation_count >= 2:
+                    ban_expiry = current_time + timedelta(seconds=self.second_violation_ban_seconds)
+                    self._session_bans[session_id] = ban_expiry
+                    retry_after = self.second_violation_ban_seconds
+                    return False, "Rate limit exceeded. Account temporarily banned", retry_after
+                else:
+                    ban_expiry = current_time + timedelta(seconds=self.wait_period_seconds)
+                    self._session_bans[session_id] = ban_expiry
+                    retry_after = self.wait_period_seconds
+                    return False, "Rate limit exceeded", retry_after
+
+            request_times.append(current_time)
+            return True, None, None
+
+    async def apply(self, message: str, context: FailureContext) -> Optional[str]:
+        allowed, error_msg, retry_after = await self._check_rate_limit(context.session_id)
+
+        if not allowed:
+            self.rate_limited_count += 1
+            context.metadata["rate_limited"] = True
+            context.metadata["rate_limit_error"] = error_msg
+            context.metadata["retry_after"] = retry_after
+            return None
+
+        return message
+
+    def reset(self) -> None:
+        async def _reset():
+            async with self._lock:
+                self._session_requests.clear()
+                self._session_violations.clear()
+                self._session_bans.clear()
+                self._permanent_bans.clear()
+                self.rate_limited_count = 0
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_reset())
+            else:
+                loop.run_until_complete(_reset())
+        except RuntimeError:
+            asyncio.run(_reset())
+
+    async def reset_async(self) -> None:
+        async with self._lock:
+            self._session_requests.clear()
+            self._session_violations.clear()
+            self._session_bans.clear()
+            self._permanent_bans.clear()
+            self.rate_limited_count = 0
+
+    def get_violation_count(self, session_id: str) -> int:
+        violations = self._session_violations.get(session_id, [])
+        return len(violations)
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "rate_limited_count": self.rate_limited_count,
+            "banned_sessions": len(self._permanent_bans) + len(self._session_bans),
+            "permanent_bans": len(self._permanent_bans),
+        }

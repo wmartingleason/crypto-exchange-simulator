@@ -12,7 +12,7 @@ from .connection_manager import ConnectionManager
 from .message_router import MessageRouter
 from .failure_injector import FailureInjector
 from .market_data.generator import MarketDataPublisher, RandomWalkModel, GBMPriceModel
-from .rest_api import RestAPIHandler, create_rest_routes
+from .rest_api import RestAPIHandler, create_rest_routes, RateLimiter
 from .handlers.order import OrderHandler
 from .handlers.subscription import SubscriptionHandler
 from .models.messages import MessageType
@@ -23,6 +23,8 @@ from .failures.strategies import (
     ReorderMessagesStrategy,
     CorruptMessageStrategy,
     ThrottleMessageStrategy,
+    RateLimitStrategy,
+    HardcodedVolumeDetector,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,10 +148,28 @@ class ExchangeServer:
             )
 
     def _setup_rest_api(self) -> None:
+        rate_limiter = None
+        if self.config.failures.enabled:
+            rate_limit_config = self.config.failures.modes.get("rate_limit")
+            if rate_limit_config and rate_limit_config.enabled:
+                volume_detector = HardcodedVolumeDetector(
+                    high_volume=False,
+                    volume_multiplier=0.5,
+                )
+                rate_limit_strategy = RateLimitStrategy(
+                    baseline_rps=10,
+                    wait_period_seconds=10,
+                    second_violation_ban_seconds=60,
+                    violation_window_seconds=60,
+                    volume_detector=volume_detector,
+                )
+                rate_limiter = RateLimiter(rate_limit_strategy=rate_limit_strategy)
+
         rest_handler = RestAPIHandler(
             self.exchange_engine,
             self.account_manager,
             self.market_data_publisher,
+            rate_limiter=rate_limiter,
         )
         routes = create_rest_routes(rest_handler)
         self.app.router.add_routes(routes)

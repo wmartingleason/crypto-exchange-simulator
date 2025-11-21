@@ -18,6 +18,7 @@ Test systems against realistic infrastructure failures:
 - Out-of-order delivery
 - Message corruption
 - Rate throttling
+- REST API rate limiting with escalating penalties
 
 ### Market Data
 - Geometric Brownian Motion (GBM) price model (placeholder)
@@ -155,6 +156,9 @@ Create `config.json` in your working directory:
         "enabled": true,
         "min_ms": 100,
         "max_ms": 2000
+      },
+      "rate_limit": {
+        "enabled": true
       }
     }
   }
@@ -178,6 +182,27 @@ await server.start()
 ## REST API
 
 See [REST_API.md](REST_API.md) for complete API documentation.
+
+### Rate Limiting
+
+The REST API implements rate limiting to simulate real-world exchange behavior. When enabled, the system:
+
+- Enforces baseline request limits (default: 10 requests/second)
+- Reduces limits during high-volume periods
+- Applies escalating penalties for violations:
+  - **First violation**: 10-second wait period
+  - **Second violation** (within 60 seconds): 60-second ban
+  - **Third violation**: Permanent account ban
+
+Rate-limited requests return HTTP 429 with `Retry-After` header:
+
+```json
+{
+  "error": "Rate limit exceeded",
+  "retry_after": 10,
+  "violation_count": 1
+}
+```
 
 Quick example:
 
@@ -258,7 +283,7 @@ tests/
 └── unit/                       # Unit tests
 ```
 
-## Use Cases
+## Potential Use Cases
 
 ### Infrastructure Resilience Testing
 Test trading systems against realistic network failures:
@@ -279,34 +304,14 @@ Measure system performance under various conditions:
 ### Market Data Analysis
 Test market data processing with configurable tick intervals and pricing models.
 
-## Advanced Usage
-
-### Custom Price Models
-
-```python
-from exchange_simulator.market_data.generator import PriceModel
-
-class CustomModel(PriceModel):
-    def next_price(self, current):
-        return current * (1 + self.calculate_trend())
-```
-
 ### Monitoring
 
 The dashboard provides real-time monitoring of:
 - WebSocket connection health
 - REST API availability
-- Message throughput
+- Simulated BTC/USD candlesticks
 - Account state
 - Order book depth
-
-### Scenario Testing
-
-The client includes built-in scenarios:
-- Basic trading operations
-- Market data streaming
-- Rapid order placement
-- Combined REST/WebSocket usage
 
 Run with: `python -m client.client --scenarios`
 
