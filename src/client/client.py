@@ -1,96 +1,82 @@
 """Exchange simulator client with integrated dashboard."""
 
 import asyncio
-import aiohttp
-import json
-from typing import Optional, Dict, List
+import logging
 from threading import Thread
+from typing import Optional, Dict, List
+
+import aiohttp
 
 from .dashboard import TradingDashboard
+from .network.network_manager import NetworkManager
+from .config import ClientConfig
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 
 class ExchangeClient:
     """Client for interacting with exchange simulator."""
 
-    def __init__(self, base_url: str = "http://localhost:8765", session_id: str = "client"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8765",
+        session_id: str = "client",
+        config: Optional[ClientConfig] = None,
+    ):
         self.base_url = base_url
         self.session_id = session_id
         self.headers = {"X-Session-ID": session_id}
+        self.config = config or ClientConfig()
+        self.network_manager = NetworkManager(
+            base_url=base_url, session_id=session_id, config=self.config
+        )
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
 
     async def __aenter__(self):
-        self._http_session = aiohttp.ClientSession()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._http_session:
-            await self._http_session.close()
+        await self.network_manager.close()
 
     async def connect_ws(self) -> bool:
         """Connect to WebSocket."""
-        try:
-            self._ws = await self._http_session.ws_connect(f"{self.base_url.replace('http', 'ws')}/ws")
-            return True
-        except Exception as e:
-            print(f"WebSocket connection failed: {e}")
-            return False
+        return await self.network_manager.connect_ws()
 
     async def subscribe(self, channel: str, symbol: str) -> bool:
         """Subscribe to WebSocket channel."""
-        if not self._ws or self._ws.closed:
-            return False
-
         msg = {
             "type": "SUBSCRIBE",
             "channel": channel,
             "symbol": symbol,
             "request_id": f"{channel}_{symbol}",
         }
-        await self._ws.send_str(json.dumps(msg))
-        return True
+        return await self.network_manager.send_ws_message(msg)
 
     async def receive_ws_message(self, timeout: float = 1.0) -> Optional[Dict]:
         """Receive WebSocket message."""
-        if not self._ws or self._ws.closed:
-            return None
-
-        try:
-            msg = await asyncio.wait_for(self._ws.receive(), timeout=timeout)
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                return json.loads(msg.data)
-        except asyncio.TimeoutError:
-            return None
-        except Exception as e:
-            print(f"WebSocket receive error: {e}")
-            return None
+        return await self.network_manager.receive_ws_message(timeout=timeout)
 
     async def get_balance(self) -> Optional[Dict[str, str]]:
         """Get account balance via REST."""
-        try:
-            async with self._http_session.get(
-                f"{self.base_url}/api/v1/balance",
-                headers=self.headers
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["balances"]
-        except Exception as e:
-            print(f"Get balance failed: {e}")
+        resp = await self.network_manager.rest_request(
+            "GET", "/api/v1/balance", headers=self.headers
+        )
+        if resp and resp.status == 200:
+            data = await resp.json()
+            return data.get("balances")
         return None
 
     async def get_ticker(self, symbol: str) -> Optional[Dict]:
         """Get ticker data via REST."""
-        try:
-            async with self._http_session.get(
-                f"{self.base_url}/api/v1/ticker?symbol={symbol}"
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            print(f"Get ticker failed: {e}")
+        resp = await self.network_manager.rest_request(
+            "GET", f"/api/v1/ticker?symbol={symbol}"
+        )
+        if resp and resp.status == 200:
+            return await resp.json()
         return None
 
     async def place_order(
@@ -111,47 +97,43 @@ class ExchangeClient:
         if price:
             order_data["price"] = price
 
-        try:
-            async with self._http_session.post(
-                f"{self.base_url}/api/v1/orders",
-                json=order_data,
-                headers=self.headers
-            ) as resp:
-                if resp.status == 201:
-                    return await resp.json()
-                else:
+        resp = await self.network_manager.rest_request(
+            "POST",
+            "/api/v1/orders",
+            json=order_data,
+            headers=self.headers,
+        )
+        if resp:
+            if resp.status == 201:
+                return await resp.json()
+            else:
+                try:
                     data = await resp.json()
                     print(f"Order placement failed: {data.get('error')}")
-        except Exception as e:
-            print(f"Place order failed: {e}")
+                except:
+                    pass
         return None
 
     async def get_orders(self, status: Optional[str] = None) -> List[Dict]:
         """Get orders via REST."""
-        url = f"{self.base_url}/api/v1/orders"
+        endpoint = "/api/v1/orders"
         if status:
-            url += f"?status={status}"
+            endpoint += f"?status={status}"
 
-        try:
-            async with self._http_session.get(url, headers=self.headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["orders"]
-        except Exception as e:
-            print(f"Get orders failed: {e}")
+        resp = await self.network_manager.rest_request(
+            "GET", endpoint, headers=self.headers
+        )
+        if resp and resp.status == 200:
+            data = await resp.json()
+            return data.get("orders", [])
         return []
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel order via REST."""
-        try:
-            async with self._http_session.delete(
-                f"{self.base_url}/api/v1/orders/{order_id}",
-                headers=self.headers
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            print(f"Cancel order failed: {e}")
-            return False
+        resp = await self.network_manager.rest_request(
+            "DELETE", f"/api/v1/orders/{order_id}", headers=self.headers
+        )
+        return resp is not None and resp.status == 200
 
 
 async def run_scenarios(base_url: str = "http://localhost:8765"):

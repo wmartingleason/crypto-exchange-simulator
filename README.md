@@ -187,6 +187,32 @@ await server.start()
 
 See [REST_API.md](REST_API.md) for complete API documentation.
 
+### Historical Price Data
+
+Use `/api/v1/prices` to backfill ticks whenever WebSocket data is missed:
+
+```
+GET /api/v1/prices?symbol=BTC/USD&start=2025-11-21T00:00:00Z&limit=500
+```
+
+```json
+{
+  "symbol": "BTC/USD",
+  "prices": [
+    {
+      "timestamp": "2025-11-21T00:00:00.123456+00:00",
+      "price": "50000.12",
+      "bid": "49997.62",
+      "ask": "50002.62",
+      "volume_24h": "12.5"
+    }
+  ]
+}
+```
+
+The server keeps a rolling history per symbol and supports optional `start`, `end`,
+and `limit` parameters (default limit 500).
+
 ### Rate Limiting
 
 The REST API implements rate limiting to simulate real-world exchange behavior. When enabled, the system:

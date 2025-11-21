@@ -1,6 +1,7 @@
 """REST API handlers for the exchange simulator."""
 
 import logging
+from datetime import datetime
 from typing import Dict, Any, Optional
 from aiohttp import web
 from decimal import Decimal
@@ -64,6 +65,20 @@ class RateLimiter:
 
 
 class RestAPIHandler:
+    def _parse_timestamp(self, value: Optional[str]) -> Optional[datetime]:
+        """Parse ISO timestamp string into datetime."""
+        if not value:
+            return None
+        ts_str = value
+        if ts_str.endswith("Z"):
+            ts_str = ts_str.replace("Z", "+00:00")
+        elif "+" not in ts_str and ts_str.count("-") <= 2:
+            ts_str = ts_str + "+00:00"
+        try:
+            return datetime.fromisoformat(ts_str)
+        except ValueError:
+            return None
+
     """REST API request handlers."""
 
     def __init__(
@@ -143,9 +158,23 @@ class RestAPIHandler:
             )
 
         market_data = generator.get_market_data_message()
-        await self._apply_outbound_latency()
-        return web.json_response(
-            {
+        if market_data is None:
+            # Build a snapshot using the generator's current state when no new tick is ready
+            spread = generator.current_price * Decimal("0.0001")
+            bid = generator.current_price - spread / 2
+            ask = generator.current_price + spread / 2
+            response_data = {
+                "symbol": symbol,
+                "last_price": str(generator.current_price),
+                "bid": str(bid),
+                "ask": str(ask),
+                "high_24h": str(generator.high_24h),
+                "low_24h": str(generator.low_24h),
+                "volume_24h": str(generator.volume_24h),
+                "timestamp": generator.last_update.isoformat(),
+            }
+        else:
+            response_data = {
                 "symbol": market_data.symbol,
                 "last_price": str(market_data.last_price),
                 "bid": str(market_data.bid),
@@ -155,7 +184,9 @@ class RestAPIHandler:
                 "volume_24h": str(market_data.volume_24h),
                 "timestamp": market_data.timestamp.isoformat(),
             }
-        )
+
+        await self._apply_outbound_latency()
+        return web.json_response(response_data)
 
     async def place_order(self, request: web.Request) -> web.Response:
         """Place a new order.
@@ -389,6 +420,61 @@ class RestAPIHandler:
             {"symbol": symbol, "asset": base_asset, "quantity": str(position)}
         )
 
+    async def get_price_history(self, request: web.Request) -> web.Response:
+        """Get historical raw price data."""
+        await self._check_rate_limit(request)
+        await self._apply_inbound_latency()
+
+        symbol = request.query.get("symbol")
+        if not symbol:
+            await self._apply_outbound_latency()
+            return web.json_response(
+                {"error": "symbol parameter required"}, status=400
+            )
+
+        generator = self.market_data_publisher.get_generator(symbol)
+        if not generator:
+            await self._apply_outbound_latency()
+            return web.json_response(
+                {"error": f"Symbol {symbol} not found"}, status=404
+            )
+
+        start_ts = self._parse_timestamp(request.query.get("start"))
+        if request.query.get("start") and start_ts is None:
+            await self._apply_outbound_latency()
+            return web.json_response(
+                {"error": "Invalid start timestamp"}, status=400
+            )
+
+        end_ts = self._parse_timestamp(request.query.get("end"))
+        if request.query.get("end") and end_ts is None:
+            await self._apply_outbound_latency()
+            return web.json_response({"error": "Invalid end timestamp"}, status=400)
+
+        limit_param = request.query.get("limit")
+        limit = None
+        if limit_param:
+            try:
+                limit = max(1, min(2000, int(limit_param)))
+            except ValueError:
+                await self._apply_outbound_latency()
+                return web.json_response({"error": "Invalid limit"}, status=400)
+
+        history = generator.get_price_history(start=start_ts, end=end_ts, limit=limit)
+        response_data = [
+            {
+                "timestamp": entry["timestamp"].isoformat(),
+                "price": str(entry["price"]),
+                "bid": str(entry["bid"]),
+                "ask": str(entry["ask"]),
+                "volume_24h": str(entry["volume_24h"]),
+            }
+            for entry in history
+        ]
+
+        await self._apply_outbound_latency()
+        return web.json_response({"symbol": symbol, "prices": response_data})
+
 
 def create_rest_routes(handler: RestAPIHandler) -> list:
     """Create REST API routes.
@@ -403,6 +489,7 @@ def create_rest_routes(handler: RestAPIHandler) -> list:
         web.get("/health", handler.health_check),
         web.get("/api/v1/symbols", handler.get_symbols),
         web.get("/api/v1/ticker", handler.get_ticker),
+        web.get("/api/v1/prices", handler.get_price_history),
         web.post("/api/v1/orders", handler.place_order),
         web.delete("/api/v1/orders/{order_id}", handler.cancel_order),
         web.get("/api/v1/orders/{order_id}", handler.get_order),

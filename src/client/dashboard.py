@@ -2,10 +2,13 @@
 
 import asyncio
 import json
-import aiohttp
-from datetime import datetime, timedelta
+import logging
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from threading import Thread, Lock
+from typing import Any, Optional
+
+import aiohttp
 import plotly.graph_objs as go
 from dash import Dash, dcc, html
 from dash.dependencies import Output, Input
@@ -247,7 +250,12 @@ class CandlestickAggregator:
 class TradingDashboard:
     """Trading dashboard with integrated market data and account management."""
 
-    def __init__(self, base_url: str = "http://localhost:8765", symbol: str = "BTC/USD"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8765",
+        symbol: str = "BTC/USD",
+        config=None,
+    ):
         self.base_url = base_url
         self.ws_url = base_url.replace("http", "ws") + "/ws"
         self.symbol = symbol
@@ -258,90 +266,169 @@ class TradingDashboard:
         self.candlestick_aggregator = CandlestickAggregator(interval_seconds=1)
         self.current_interval = 1
         self.running = False
+        self.logger = logging.getLogger(__name__)
+
+        # Initialize network manager
+        from .network.network_manager import NetworkManager
+        from .config import ClientConfig
+
+        self.config = config or ClientConfig()
+        self.network_manager = NetworkManager(
+            base_url=base_url, session_id=self.session_id, config=self.config
+        )
+
+        # Set up callbacks
+        self.network_manager.set_on_ws_message(self._handle_ws_message)
+        self.network_manager.set_on_reconciliation(self._handle_reconciliation)
+
+    def _handle_ws_message(self, data: dict) -> None:
+        """Handle WebSocket message from network manager."""
+        try:
+            self.health.ws_message_received()
+
+            if data.get("type") == "MARKET_DATA":
+                timestamp = self._parse_timestamp(data["timestamp"])
+                if timestamp is None:
+                    self.logger.warning("Received market data with invalid timestamp: %s", data.get("timestamp"))
+                    return
+                price = float(data["last_price"])
+                # Use a small volume increment per tick since we don't have actual trade volume
+                # This is for visualization purposes only
+                tick_volume = 0.01
+
+                self.market_data.add(
+                    timestamp,
+                    price,
+                    float(data["bid"]),
+                    float(data["ask"]),
+                    float(data["volume_24h"]),
+                    data["symbol"],
+                )
+
+                # Add tick to candlestick aggregator
+                self.candlestick_aggregator.add_tick(timestamp, price, tick_volume)
+        except Exception as e:
+            print(f"Error processing WebSocket message: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _handle_reconciliation(self, recon_type: str, data: Any) -> None:
+        """Handle reconciliation events."""
+        if recon_type == "market_data":
+            # Market data was reconciled - update if needed
+            symbol = data.get("symbol")
+            market_data = data.get("data")
+            if symbol and market_data:
+                # Update market data buffer with reconciled data
+                ts_str = market_data.get("timestamp", "")
+                if ts_str:
+                    if "Z" in ts_str:
+                        ts_str = ts_str.replace("Z", "+00:00")
+                    elif "+" not in ts_str and ts_str.count("-") <= 2:
+                        ts_str = ts_str + "+00:00"
+                    timestamp = datetime.fromisoformat(ts_str)
+                    price = float(market_data.get("last_price", 0))
+                    self.market_data.add(
+                        timestamp,
+                        price,
+                        float(market_data.get("bid", 0)),
+                        float(market_data.get("ask", 0)),
+                        float(market_data.get("volume_24h", 0)),
+                        symbol,
+                    )
+        elif recon_type == "price_history":
+            symbol = data.get("symbol")
+            prices = data.get("prices", [])
+            if symbol and prices:
+                self.logger.info(
+                    "Applying %d reconciled price points for %s",
+                    len(prices),
+                    symbol,
+                )
+                for point in prices:
+                    timestamp = self._parse_timestamp(point.get("timestamp"))
+                    if not timestamp:
+                        self.logger.warning("Skipping price history entry with invalid timestamp")
+                        continue
+                    price = float(point.get("price", 0))
+                    bid = float(point.get("bid", 0))
+                    ask = float(point.get("ask", 0))
+                    volume = float(point.get("volume_24h", 0))
+                    self.market_data.add(timestamp, price, bid, ask, volume, symbol)
+                    self.candlestick_aggregator.add_tick(timestamp, price, 0.01)
+        elif recon_type == "orders":
+            # Orders were reconciled
+            self.account.update_orders(data)
+        elif recon_type == "balance":
+            # Balance was reconciled
+            self.account.update_balances(data)
 
     async def start_websocket(self):
         while self.running:
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(self.ws_url) as ws:
-                        subscribe_msg = {
-                            "type": "SUBSCRIBE",
-                            "channel": "TICKER",
-                            "symbol": self.symbol,
-                            "request_id": "dashboard_sub",
-                        }
-                        await ws.send_str(json.dumps(subscribe_msg))
+                if await self.network_manager.connect_ws():
+                    subscribe_msg = {
+                        "type": "SUBSCRIBE",
+                        "channel": "TICKER",
+                        "symbol": self.symbol,
+                        "request_id": "dashboard_sub",
+                    }
+                    await self.network_manager.send_ws_message(subscribe_msg)
 
-                        async for msg in ws:
-                            if not self.running:
+                    while self.running:
+                        msg = await self.network_manager.receive_ws_message(timeout=1.0)
+                        if msg is None:
+                            # Check connection health
+                            health = self.network_manager.get_connection_health()
+                            if not health.get("ws_connected"):
                                 break
-
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    data = json.loads(msg.data)
-                                    self.health.ws_message_received()
-
-                                    if data.get("type") == "MARKET_DATA":
-                                        # Parse timestamp - handle both with and without timezone
-                                        ts_str = data["timestamp"]
-                                        if "Z" in ts_str:
-                                            ts_str = ts_str.replace("Z", "+00:00")
-                                        elif "+" not in ts_str and ts_str.count("-") <= 2:
-                                            # Naive datetime - assume UTC
-                                            ts_str = ts_str + "+00:00"
-                                        timestamp = datetime.fromisoformat(ts_str)
-                                        price = float(data["last_price"])
-                                        # Use a small volume increment per tick since we don't have actual trade volume
-                                        # This is for visualization purposes only
-                                        tick_volume = 0.01
-                                        
-                                        self.market_data.add(
-                                            timestamp,
-                                            price,
-                                            float(data["bid"]),
-                                            float(data["ask"]),
-                                            float(data["volume_24h"]),
-                                            data["symbol"],
-                                        )
-                                        
-                                        # Add tick to candlestick aggregator
-                                        self.candlestick_aggregator.add_tick(timestamp, price, tick_volume)
-                                except Exception as e:
-                                    print(f"Error processing WebSocket message: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                            elif msg.type == aiohttp.WSMsgType.CLOSED:
-                                self.health.ws_disconnected()
-                                break
-                            elif msg.type == aiohttp.WSMsgType.ERROR:
-                                self.health.ws_disconnected()
-                                break
+                            continue
 
             except Exception as e:
                 self.health.ws_disconnected()
+                print(f"WebSocket error: {e}")
 
             if self.running:
+                await self.network_manager.disconnect_ws()
                 await asyncio.sleep(1)
+
+    def _parse_timestamp(self, value: str) -> Optional[datetime]:
+        """Parse ISO timestamp strings."""
+        if not value:
+            return None
+        ts_str = value
+        if "Z" in ts_str:
+            ts_str = ts_str.replace("Z", "+00:00")
+        elif "+" not in ts_str and ts_str.count("-") <= 2:
+            ts_str = ts_str + "+00:00"
+        try:
+            return datetime.fromisoformat(ts_str)
+        except ValueError:
+            return None
 
     async def update_account_state(self):
         """Periodically fetch account state via REST."""
-        headers = {"X-Session-ID": self.session_id}
-
         while self.running:
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self.base_url}/health") as resp:
-                        self.health.rest_check(resp.status == 200)
+                # Health check
+                health_resp = await self.network_manager.rest_request("GET", "/health")
+                self.health.rest_check(health_resp is not None and health_resp.status == 200)
 
-                    async with session.get(f"{self.base_url}/api/v1/balance", headers=headers) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            self.account.update_balances(data["balances"])
+                # Balance
+                balance_resp = await self.network_manager.rest_request(
+                    "GET", "/api/v1/balance"
+                )
+                if balance_resp and balance_resp.status == 200:
+                    data = await balance_resp.json()
+                    self.account.update_balances(data.get("balances", {}))
 
-                    async with session.get(f"{self.base_url}/api/v1/orders", headers=headers) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            self.account.update_orders(data["orders"])
+                # Orders
+                orders_resp = await self.network_manager.rest_request(
+                    "GET", "/api/v1/orders"
+                )
+                if orders_resp and orders_resp.status == 200:
+                    data = await orders_resp.json()
+                    self.account.update_orders(data.get("orders", []))
 
             except Exception as e:
                 self.health.rest_check(False)
@@ -365,6 +452,10 @@ class TradingDashboard:
     def create_app(self):
         """Create Dash application."""
         app = Dash(__name__, update_title=None)
+        app.logger.disabled = True
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        logging.getLogger("dash").setLevel(logging.ERROR)
+        logging.getLogger("plotly").setLevel(logging.ERROR)
 
         app.layout = html.Div([
             html.Div([
@@ -468,8 +559,15 @@ class TradingDashboard:
             if not candles:
                 return {"data": [], "layout": go.Layout(title="Price Movement", template="plotly_white")}
 
-            # Extract OHLCV data from candles
-            timestamps = [c["timestamp"] for c in candles]
+            # Extract OHLCV data from candles and convert timestamps to local timezone
+            timestamps = []
+            for c in candles:
+                ts = c["timestamp"]
+                # Convert UTC to local timezone if timezone-aware
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone()
+                timestamps.append(ts)
+            
             opens = [c["open"] for c in candles]
             highs = [c["high"] for c in candles]
             lows = [c["low"] for c in candles]
@@ -480,7 +578,7 @@ class TradingDashboard:
             if len(candles) > 0:
                 # Calculate the time span for 120 candles
                 time_span_seconds = 120 * self.current_interval
-                # Start from the first candle's timestamp
+                # Start from the first candle's timestamp (already converted to local)
                 xaxis_start = timestamps[0]
                 # End at first timestamp + time span (with small padding for better visualization)
                 xaxis_end = xaxis_start + timedelta(seconds=time_span_seconds + self.current_interval)
@@ -535,19 +633,30 @@ class TradingDashboard:
 
             spreads = [ask - bid for bid, ask in zip(data["bids"], data["asks"])]
 
+            # Convert timestamps to local timezone
+            local_timestamps = []
+            for ts in data["timestamps"]:
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone()
+                local_timestamps.append(ts)
+
             # Calculate the same x-axis range as the price chart (120 candles worth of time)
             # Get the candles to determine the exact time window used in the price chart
             candles = self.candlestick_aggregator.get_candles(max_candles=120)
             if len(candles) > 0:
                 # Use the same calculation as the price chart
                 time_span_seconds = 120 * self.current_interval
-                xaxis_start = candles[0]["timestamp"]
+                xaxis_start_ts = candles[0]["timestamp"]
+                # Convert to local timezone
+                if xaxis_start_ts.tzinfo is not None:
+                    xaxis_start_ts = xaxis_start_ts.astimezone()
+                xaxis_start = xaxis_start_ts
                 xaxis_end = xaxis_start + timedelta(seconds=time_span_seconds + self.current_interval)
                 xaxis_range = [xaxis_start, xaxis_end]
-            elif len(data["timestamps"]) > 0:
+            elif len(local_timestamps) > 0:
                 # Fallback: calculate from tick data if no candles yet
                 time_span_seconds = 120 * self.current_interval
-                xaxis_end = data["timestamps"][-1]
+                xaxis_end = local_timestamps[-1]
                 xaxis_start = xaxis_end - timedelta(seconds=time_span_seconds)
                 xaxis_range = [xaxis_start, xaxis_end]
             else:
@@ -556,7 +665,7 @@ class TradingDashboard:
             return {
                 "data": [
                     go.Scatter(
-                        x=data["timestamps"],
+                        x=local_timestamps,
                         y=spreads,
                         mode="lines",
                         fill="tozeroy",
@@ -658,3 +767,11 @@ class TradingDashboard:
         except KeyboardInterrupt:
             print("\nStopping dashboard...")
             self.running = False
+            # Close network manager connections
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.network_manager.close())
+                loop.close()
+            except Exception as e:
+                print(f"Error closing network manager: {e}")

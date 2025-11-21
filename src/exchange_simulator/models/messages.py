@@ -203,6 +203,7 @@ class MarketDataMessage(Message):
     volume_24h: Decimal = Field(default=Decimal("0"), description="24h volume")
     high_24h: Optional[Decimal] = Field(None, description="24h high")
     low_24h: Optional[Decimal] = Field(None, description="24h low")
+    sequence_id: int = Field(..., description="Sequence ID for gap detection")
 
 
 class OrderBookLevel(BaseModel):

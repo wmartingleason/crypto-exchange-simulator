@@ -3,8 +3,9 @@
 import asyncio
 import math
 import random
+from collections import deque
 from decimal import Decimal
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone
 
 from ..models.messages import MarketDataMessage, TradeMessage
@@ -155,6 +156,10 @@ class MarketDataGenerator:
         self.low_24h = initial_price
         self.volume_24h = Decimal("0")
         self.last_update = datetime.now(timezone.utc)
+        self._last_broadcast_timestamp = None
+        self._sequence_id = 0  # Will be incremented to 1 for first message
+        self._price_history: deque[Dict[str, Decimal | datetime]] = deque(maxlen=1000000)
+        self._record_price_history()
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -193,6 +198,7 @@ class MarketDataGenerator:
             self.low_24h = new_price
 
         self.last_update = datetime.now(timezone.utc)
+        self._record_price_history()
 
     def get_current_price(self) -> Decimal:
         """Get current price.
@@ -210,17 +216,24 @@ class MarketDataGenerator:
         """
         self.current_price = price
         self.last_update = datetime.now(timezone.utc)
+        self._record_price_history()
 
-    def get_market_data_message(self) -> MarketDataMessage:
-        """Generate a market data message.
+    def get_market_data_message(self) -> Optional[MarketDataMessage]:
+        """Generate a market data message if price has changed since last broadcast.
 
         Returns:
-            Market data message
+            Market data message, or None if price hasn't changed
         """
-        # Simulate bid/ask spread (0.01% of price)
-        spread = self.current_price * Decimal("0.0001")
-        bid = self.current_price - spread / 2
-        ask = self.current_price + spread / 2
+        # Only generate message if price has actually changed
+        if self._last_broadcast_timestamp == self.last_update:
+            return None
+
+        # Increment sequence ID for each message
+        self._sequence_id += 1
+
+        bid, ask = self._compute_bid_ask(self.current_price)
+
+        self._last_broadcast_timestamp = self.last_update
 
         return MarketDataMessage(
             symbol=self.symbol,
@@ -230,7 +243,48 @@ class MarketDataGenerator:
             volume_24h=self.volume_24h,
             high_24h=self.high_24h,
             low_24h=self.low_24h,
+            timestamp=self.last_update,
+            sequence_id=self._sequence_id,
         )
+
+    def _compute_bid_ask(self, price: Decimal) -> Tuple[Decimal, Decimal]:
+        """Compute bid/ask using fixed spread."""
+        spread = price * Decimal("0.0001")
+        bid = price - spread / 2
+        ask = price + spread / 2
+        return bid, ask
+
+    def _record_price_history(self) -> None:
+        """Record latest tick for history queries."""
+        bid, ask = self._compute_bid_ask(self.current_price)
+        self._price_history.append(
+            {
+                "timestamp": self.last_update,
+                "price": self.current_price,
+                "bid": bid,
+                "ask": ask,
+                "volume_24h": self.volume_24h,
+            }
+        )
+
+    def get_price_history(
+        self,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Decimal | datetime]]:
+        """Retrieve historical raw price data."""
+        history = list(self._price_history)
+
+        if start:
+            history = [entry for entry in history if entry["timestamp"] >= start]
+        if end:
+            history = [entry for entry in history if entry["timestamp"] <= end]
+
+        if limit is not None and len(history) > limit:
+            history = history[-limit:]
+
+        return history
 
     def generate_trade_message(self, quantity: Optional[Decimal] = None) -> TradeMessage:
         """Generate a simulated trade message.

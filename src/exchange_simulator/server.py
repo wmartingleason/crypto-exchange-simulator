@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Optional
 from aiohttp import web
 import aiohttp
 
@@ -26,6 +27,7 @@ from .failures.strategies import (
     RateLimitStrategy,
     HardcodedVolumeDetector,
     LatencySimulationStrategy,
+    SilentConnectionStrategy,
     FailureContext,
 )
 
@@ -52,6 +54,7 @@ class ExchangeServer:
         self.connection_manager = ConnectionManager()
         self.message_router = MessageRouter()
         self.failure_injector = FailureInjector()
+        self._silent_connection_strategy: Optional[SilentConnectionStrategy] = None
 
         self.market_data_publisher = MarketDataPublisher()
         initial_prices = config.get_initial_prices_decimal()
@@ -113,52 +116,60 @@ class ExchangeServer:
 
     def _configure_failures(self) -> None:
         modes = self.config.failures.modes
+        self._silent_connection_strategy = None
 
-        if modes.get("drop_messages", {}).get("enabled"):
-            cfg = modes["drop_messages"]
+        drop_cfg = modes.get("drop_messages")
+        if drop_cfg and drop_cfg.enabled:
             self.failure_injector.add_inbound_strategy(
-                DropMessageStrategy(probability=cfg.get("probability", 0.1))
+                DropMessageStrategy(probability=drop_cfg.probability or 0.1)
             )
 
-        if modes.get("delay_messages", {}).get("enabled"):
-            cfg = modes["delay_messages"]
+        delay_cfg = modes.get("delay_messages")
+        if delay_cfg and delay_cfg.enabled:
             self.failure_injector.add_inbound_strategy(
                 DelayMessageStrategy(
-                    min_delay_ms=cfg.get("min_ms", 100),
-                    max_delay_ms=cfg.get("max_ms", 1000),
+                    min_delay_ms=delay_cfg.min_ms or 100,
+                    max_delay_ms=delay_cfg.max_ms or 1000,
                 )
             )
 
-        if modes.get("duplicate_messages", {}).get("enabled"):
-            cfg = modes["duplicate_messages"]
+        duplicate_cfg = modes.get("duplicate_messages")
+        if duplicate_cfg and duplicate_cfg.enabled:
             self.failure_injector.add_outbound_strategy(
                 DuplicateMessageStrategy(
-                    probability=cfg.get("probability", 0.05),
-                    max_duplicates=cfg.get("max_duplicates", 2),
+                    probability=duplicate_cfg.probability or 0.05,
+                    max_duplicates=duplicate_cfg.max_duplicates or 2,
                 )
             )
 
-        if modes.get("reorder_messages", {}).get("enabled"):
-            cfg = modes["reorder_messages"]
+        reorder_cfg = modes.get("reorder_messages")
+        if reorder_cfg and reorder_cfg.enabled:
             self.failure_injector.add_inbound_strategy(
-                ReorderMessagesStrategy(window_size=cfg.get("window_size", 5))
+                ReorderMessagesStrategy(window_size=reorder_cfg.window_size or 5)
             )
 
-        if modes.get("corrupt_messages", {}).get("enabled"):
-            cfg = modes["corrupt_messages"]
+        corrupt_cfg = modes.get("corrupt_messages")
+        if corrupt_cfg and corrupt_cfg.enabled:
             self.failure_injector.add_outbound_strategy(
                 CorruptMessageStrategy(
-                    probability=cfg.get("probability", 0.01),
-                    corruption_level=cfg.get("corruption_level", 0.1),
+                    probability=corrupt_cfg.probability or 0.01,
+                    corruption_level=corrupt_cfg.corruption_level or 0.1,
                 )
             )
 
-        if modes.get("throttle_messages", {}).get("enabled"):
-            cfg = modes["throttle_messages"]
+        throttle_cfg = modes.get("throttle_messages")
+        if throttle_cfg and throttle_cfg.enabled:
             self.failure_injector.add_inbound_strategy(
                 ThrottleMessageStrategy(
-                    max_messages_per_second=cfg.get("max_messages_per_second", 10)
+                    max_messages_per_second=throttle_cfg.max_messages_per_second or 10
                 )
+            )
+
+        silent_cfg = modes.get("silent_connection")
+        if silent_cfg and silent_cfg.enabled:
+            self._silent_connection_strategy = SilentConnectionStrategy(
+                enabled=True,
+                after_messages=silent_cfg.after_messages or 0,
             )
 
     def _setup_rest_api(self) -> None:
@@ -190,6 +201,29 @@ class ExchangeServer:
         routes = create_rest_routes(rest_handler)
         self.app.router.add_routes(routes)
 
+    async def _apply_silent_strategy(
+        self, message: Optional[str], session_id: str, message_type: str
+    ) -> Optional[str]:
+        if message is None or not self._silent_connection_strategy:
+            return message
+
+        context = FailureContext(
+            session_id=session_id,
+            message_type=message_type,
+            direction="outbound",
+        )
+        return await self._silent_connection_strategy.apply(message, context)
+
+    async def _apply_outbound_failures(
+        self, message: str, session_id: str, message_type: str
+    ) -> Optional[str]:
+        processed = await self.failure_injector.inject_outbound(
+            message, session_id, message_type
+        )
+        if processed is None:
+            return None
+        return await self._apply_silent_strategy(processed, session_id, message_type)
+
     async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -211,8 +245,17 @@ class ExchangeServer:
 
                     if response:
                         response_str = self.message_router.serialize_message(response)
-                        final_message = await self.failure_injector.inject_outbound(
-                            response_str, session_id
+                        response_type = getattr(response, "type", None)
+                        if response_type is not None:
+                            message_type = (
+                                response_type.value
+                                if hasattr(response_type, "value")
+                                else str(response_type)
+                            )
+                        else:
+                            message_type = "UNKNOWN"
+                        final_message = await self._apply_outbound_failures(
+                            response_str, session_id, message_type
                         )
 
                         if final_message is not None:
@@ -234,20 +277,32 @@ class ExchangeServer:
             try:
                 for symbol, generator in self.market_data_publisher.generators.items():
                     market_data = generator.get_market_data_message()
+                    if market_data is None:
+                        # Price hasn't changed, skip broadcasting
+                        continue
+
                     message_str = self.message_router.serialize_message(market_data)
                     channel_key = f"TICKER:{symbol}"
 
-                    if self._latency_strategy:
-                        context = FailureContext(
-                            session_id="broadcast",
-                            message_type="MARKET_DATA",
-                            direction="outbound",
-                        )
-                        await self._latency_strategy.apply(message_str, context)
-
-                    await self.connection_manager.broadcast_to_channel(
-                        channel_key, message_str
+                    final_message = await self.failure_injector.inject_outbound(
+                        message_str, "broadcast", "MARKET_DATA"
                     )
+
+                    if final_message is None:
+                        continue
+
+                    subscribed_sessions = self.connection_manager.get_subscribed_sessions(
+                        channel_key
+                    )
+                    for session_id in subscribed_sessions:
+                        session_message = await self._apply_silent_strategy(
+                            final_message, session_id, "MARKET_DATA"
+                        )
+                        if session_message is None:
+                            continue
+                        await self.connection_manager.send_to_session(
+                            session_id, session_message
+                        )
 
                 await asyncio.sleep(self.config.exchange.tick_interval)
             except asyncio.CancelledError:
@@ -312,16 +367,37 @@ class ExchangeServer:
             await self.stop()
 
 
-async def main() -> None:
+async def main(config_path: Optional[str] = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    config = Config()
+    if config_path:
+        config = Config.from_file(config_path)
+        logger.info(f"Loaded configuration from {config_path}")
+    else:
+        import os
+        default_config = os.path.join(os.path.dirname(__file__), "config.json")
+        if os.path.exists(default_config):
+            config = Config.from_file(default_config)
+            logger.info(f"Loaded configuration from {default_config}")
+        else:
+            config = Config()
+            logger.info("Using default configuration")
+
     server = ExchangeServer(config)
     await server.run_forever()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+    parser = argparse.ArgumentParser(description="Exchange simulator server")
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to configuration JSON file",
+        default=None,
+    )
+    args = parser.parse_args()
+    asyncio.run(main(args.config))

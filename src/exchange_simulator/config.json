@@ -13,7 +13,7 @@
       "BTC/USD": "50000",
       "ETH/USD": "3000"
     },
-    "tick_interval": 0.001,
+    "tick_interval": 0.1,
     "default_balance": {
       "USD": "100000",
       "BTC": "10",
@@ -26,14 +26,14 @@
     }
   },
   "failures": {
-    "enabled": false,
+    "enabled": true,
     "modes": {
       "drop_messages": {
-        "enabled": true,
+        "enabled": false,
         "probability": 0.05
       },
       "delay_messages": {
-        "enabled": true,
+        "enabled": false,
         "min_ms": 100,
         "max_ms": 2000
       },
@@ -54,6 +54,10 @@
       "throttle_messages": {
         "enabled": false,
         "max_messages_per_second": 10
+      },
+      "silent_connection": {
+        "enabled": true,
+        "after_messages": 50
       }
     }
   }

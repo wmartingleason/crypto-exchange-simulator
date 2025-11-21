@@ -342,6 +342,31 @@ class TestRestAPI(AioHTTPTestCase):
         assert "error" in data
 
     @unittest_run_loop
+    async def test_get_price_history(self):
+        """Test fetching raw price history."""
+        generator = self.market_data_publisher.get_generator("BTC/USD")
+        generator.set_price(Decimal("50500"))
+        generator.set_price(Decimal("51000"))
+
+        resp = await self.client.request(
+            "GET", "/api/v1/prices?symbol=BTC/USD&limit=2"
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["symbol"] == "BTC/USD"
+        assert "prices" in data
+        assert len(data["prices"]) <= 2
+        assert all("timestamp" in p and "price" in p for p in data["prices"])
+
+    @unittest_run_loop
+    async def test_get_price_history_invalid_symbol(self):
+        """Test price history endpoint with invalid symbol."""
+        resp = await self.client.request("GET", "/api/v1/prices?symbol=INVALID")
+        assert resp.status == 404
+        data = await resp.json()
+        assert "error" in data
+
+    @unittest_run_loop
     async def test_session_isolation(self):
         """Test that different sessions have isolated orders."""
         # Place order in session 1

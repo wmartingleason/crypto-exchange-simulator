@@ -75,6 +75,7 @@ class FailureMode(BaseModel):
     max_duplicates: Optional[int] = Field(None, description="Maximum number of duplicates")
     max_messages_per_second: Optional[int] = Field(None, description="Throttle rate")
     corruption_level: Optional[float] = Field(None, description="Corruption level")
+    after_messages: Optional[int] = Field(None, description="Number of messages before going silent")
 
 
 class LatencyConfig(BaseModel):
@@ -103,7 +104,7 @@ class LatencyConfig(BaseModel):
 class FailuresConfig(BaseModel):
     """Failures configuration."""
 
-    enabled: bool = Field(default=False, description="Enable failure injection")
+    enabled: bool = Field(default=True, description="Enable failure injection")
     latency: LatencyConfig = Field(
         default_factory=LatencyConfig,
         description="Latency simulation configuration",

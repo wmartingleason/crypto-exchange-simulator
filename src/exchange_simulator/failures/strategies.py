@@ -528,3 +528,69 @@ class LatencySimulationStrategy(FailureStrategy):
             "total_delay_seconds": self.total_delay_seconds,
             "average_delay_seconds": avg_delay,
         }
+
+
+class SilentConnectionStrategy(FailureStrategy):
+    """Strategy that stops sending outbound messages while keeping TCP connection alive."""
+
+    def __init__(self, enabled: bool = False, after_messages: int = 0) -> None:
+        """Initialize silent connection strategy.
+
+        Args:
+            enabled: Whether to enable silent connection mode
+            after_messages: Number of messages to send before going silent (0 = immediate)
+        """
+        self.enabled = enabled
+        self.after_messages = after_messages
+        self.message_count = 0
+        self.dropped_count = 0
+        self._session_message_counts: Dict[str, int] = {}
+        self._session_drop_counts: Dict[str, int] = {}
+
+    async def apply(self, message: str, context: FailureContext) -> Optional[str]:
+        """Apply silent connection strategy.
+
+        Args:
+            message: The message to process
+            context: Failure context
+
+        Returns:
+            Message if should be sent, None if connection is silent
+        """
+        session_id = context.session_id or "unknown"
+        self.message_count += 1
+
+        if not self.enabled:
+            return message
+
+        current_count = self._session_message_counts.get(session_id, 0) + 1
+        self._session_message_counts[session_id] = current_count
+
+        if current_count > self.after_messages:
+            self.dropped_count += 1
+            self._session_drop_counts[session_id] = (
+                self._session_drop_counts.get(session_id, 0) + 1
+            )
+            return None
+
+        return message
+
+    def reset(self) -> None:
+        """Reset strategy state."""
+        self.message_count = 0
+        self.dropped_count = 0
+        self._session_message_counts.clear()
+        self._session_drop_counts.clear()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get strategy statistics.
+
+        Returns:
+            Dictionary with statistics
+        """
+        return {
+            "enabled": self.enabled,
+            "message_count": self.message_count,
+            "dropped_count": self.dropped_count,
+            "session_count": len(self._session_message_counts),
+        }
