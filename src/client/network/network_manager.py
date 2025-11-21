@@ -92,6 +92,7 @@ class NetworkManager:
         # Callbacks
         self._on_ws_message: Optional[Callable[[Dict[str, Any]], None]] = None
         self._on_reconciliation: Optional[Callable[[str, Any], None]] = None
+        self._on_connection_change: Optional[Callable[[bool], None]] = None
 
     async def connect_ws(self) -> bool:
         """Connect to WebSocket and start heartbeat.
@@ -308,6 +309,16 @@ class NetworkManager:
         """
         self._on_reconciliation = callback
 
+    def set_on_connection_change(
+        self, callback: Callable[[bool], None]
+    ) -> None:
+        """Set callback for connection state changes.
+
+        Args:
+            callback: Function to call with connection state (True=connected, False=disconnected)
+        """
+        self._on_connection_change = callback
+
     def _on_market_data_reconciled(self, symbol: str, data: Dict[str, Any]) -> None:
         """Handle market data reconciliation."""
         if self._on_reconciliation:
@@ -346,6 +357,9 @@ class NetworkManager:
         self._connection_healthy = healthy
         if not healthy:
             self._ws_connected = False
+            # Notify dashboard of connection loss immediately
+            if self._on_connection_change:
+                self._on_connection_change(False)
             if (
                 self._connection_recovery_task is None
                 or self._connection_recovery_task.done()
@@ -411,6 +425,9 @@ class NetworkManager:
                 self._connection_healthy = True
                 await self._resubscribe_channels()
                 logger.info("WebSocket reconnect successful")
+                # Notify dashboard of connection restoration
+                if self._on_connection_change:
+                    self._on_connection_change(True)
                 self._connection_recovery_task = None
                 return
 

@@ -200,11 +200,20 @@ class CandlestickAggregator:
                     })
                     self.candles.append(completed_candles[-1])
 
-                    # Log completed candle info
+                    # Log completed candle info and check for discontinuities
+                    candle = completed_candles[-1]
+                    spread = candle["high"] - candle["low"]
+                    body = abs(candle["close"] - candle["open"])
+
+                    # Check if there's a discontinuity with the new candle's open
+                    discontinuity = abs(price - candle["close"])
+                    if discontinuity > 1.0:  # More than $1 gap
+                        logging.getLogger(__name__).warning(
+                            "DISCONTINUITY: Previous candle close=%.2f, new candle open=%.2f (gap=%.2f) from %s",
+                            candle["close"], price, discontinuity, source
+                        )
+
                     if logging.getLogger(__name__).isEnabledFor(logging.DEBUG):
-                        candle = completed_candles[-1]
-                        spread = candle["high"] - candle["low"]
-                        body = abs(candle["close"] - candle["open"])
                         logging.getLogger(__name__).debug(
                             "Completed candle at %s: O=%.2f H=%.2f L=%.2f C=%.2f (spread=%.2f, body=%.2f, ticks=%.0f)",
                             candle["timestamp"], candle["open"], candle["high"],
@@ -289,6 +298,10 @@ class TradingDashboard:
         # to avoid processing duplicate data when WS sends backlog after reconnection
         self._latest_processed_timestamp: Optional[datetime] = None
 
+        # Track REST polling state
+        self._rest_polling_task: Optional[asyncio.Task] = None
+        self._rest_polling_active = False
+
         # Initialize network manager
         from .network.network_manager import NetworkManager
         from .config import ClientConfig
@@ -301,6 +314,7 @@ class TradingDashboard:
         # Set up callbacks
         self.network_manager.set_on_ws_message(self._handle_ws_message)
         self.network_manager.set_on_reconciliation(self._handle_reconciliation)
+        self.network_manager.set_on_connection_change(self._handle_connection_change)
 
     def _handle_ws_message(self, data: dict) -> None:
         """Handle WebSocket message from network manager."""
@@ -315,13 +329,37 @@ class TradingDashboard:
 
                 price = float(data["last_price"])
 
-                # Skip if we've already processed this timestamp from any source
-                if self._latest_processed_timestamp is not None and timestamp <= self._latest_processed_timestamp:
-                    self.logger.debug(
-                        "Skipping WS tick at %s (already processed up to %s)",
+                # Log every WS message for debugging
+                if self._latest_processed_timestamp:
+                    time_gap = (timestamp - self._latest_processed_timestamp).total_seconds()
+                    if self._latest_processed_timestamp and hasattr(self, '_last_ws_price'):
+                        price_gap = abs(price - self._last_ws_price)
+                        if price_gap > 1.0:
+                            self.logger.warning(
+                                "WS PRICE JUMP: %.2f -> %.2f (gap=%.2f) after %.3fs",
+                                self._last_ws_price, price, price_gap, time_gap
+                            )
+                self._last_ws_price = price
+
+                # Skip if we've already processed this exact timestamp from any source
+                # Use < instead of <= to allow the same timestamp if it's a different price
+                if self._latest_processed_timestamp is not None and timestamp < self._latest_processed_timestamp:
+                    self.logger.warning(
+                        "Skipping WS tick at %s (already processed up to %s) - OUT OF ORDER",
                         timestamp, self._latest_processed_timestamp
                     )
                     return
+                elif self._latest_processed_timestamp is not None and timestamp == self._latest_processed_timestamp:
+                    self.logger.warning(
+                        "Duplicate timestamp %s - price %.2f vs previous %.2f",
+                        timestamp, price, getattr(self, '_last_price_at_timestamp', 'unknown')
+                    )
+                    # Allow it through if price is different
+                    if hasattr(self, '_last_price_at_timestamp') and abs(price - self._last_price_at_timestamp) < 0.01:
+                        self.logger.warning("Skipping duplicate tick with same price")
+                        return
+
+                self._last_price_at_timestamp = price
 
                 # Use a small volume increment per tick since we don't have actual trade volume
                 # This is for visualization purposes only
@@ -345,6 +383,24 @@ class TradingDashboard:
             print(f"Error processing WebSocket message: {e}")
             import traceback
             traceback.print_exc()
+
+    def _handle_connection_change(self, connected: bool) -> None:
+        """Handle connection state changes from network manager.
+
+        Args:
+            connected: True if connected, False if disconnected/silent
+        """
+        if not connected and not self._rest_polling_active:
+            # Connection lost - start REST polling immediately
+            self.logger.info("Connection lost, starting REST polling immediately")
+            # Create the task in the event loop
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._start_rest_polling())
+        elif connected and self._rest_polling_active:
+            # Connection restored - stop REST polling
+            self.logger.info("Connection restored, stopping REST polling")
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._stop_rest_polling())
 
     def _handle_reconciliation(self, recon_type: str, data: Any) -> None:
         """Handle reconciliation events."""
@@ -386,12 +442,17 @@ class TradingDashboard:
                         continue
 
                     # Skip if we've already processed this timestamp
-                    if self._latest_processed_timestamp is not None and timestamp <= self._latest_processed_timestamp:
-                        self.logger.debug(
-                            "Skipping REST tick at %s (already processed up to %s)",
+                    if self._latest_processed_timestamp is not None and timestamp < self._latest_processed_timestamp:
+                        self.logger.warning(
+                            "Skipping REST tick at %s (already processed up to %s) - OUT OF ORDER",
                             timestamp, self._latest_processed_timestamp
                         )
                         continue
+                    elif self._latest_processed_timestamp is not None and timestamp == self._latest_processed_timestamp:
+                        self.logger.debug(
+                            "REST tick has same timestamp %s as previous - allowing through",
+                            timestamp
+                        )
 
                     price = float(point.get("price", 0))
                     bid = float(point.get("bid", 0))
@@ -413,6 +474,9 @@ class TradingDashboard:
         while self.running:
             try:
                 if await self.network_manager.connect_ws():
+                    # WebSocket connected - stop REST polling if active
+                    await self._stop_rest_polling()
+
                     subscribe_msg = {
                         "type": "SUBSCRIBE",
                         "channel": "TICKER",
@@ -427,16 +491,40 @@ class TradingDashboard:
                             # Check connection health
                             health = self.network_manager.get_connection_health()
                             if not health.get("ws_connected"):
+                                self.logger.info("WebSocket disconnected, starting REST polling fallback")
                                 break
                             continue
 
             except Exception as e:
                 self.health.ws_disconnected()
-                print(f"WebSocket error: {e}")
+                self.logger.error(f"WebSocket error: {e}")
 
             if self.running:
                 await self.network_manager.disconnect_ws()
+                # Start REST polling while WS is offline
+                await self._start_rest_polling()
                 await asyncio.sleep(1)
+
+    async def _start_rest_polling(self):
+        """Start REST polling task if not already running."""
+        if not self._rest_polling_active:
+            self._rest_polling_active = True
+            # Start with immediate first poll to fill gap from WS disconnect detection
+            self._rest_polling_task = asyncio.create_task(self.poll_rest_market_data(immediate_first_poll=True))
+            self.logger.info("Started REST polling task with immediate first poll")
+
+    async def _stop_rest_polling(self):
+        """Stop REST polling task if running."""
+        if self._rest_polling_active:
+            self._rest_polling_active = False
+            if self._rest_polling_task:
+                self._rest_polling_task.cancel()
+                try:
+                    await self._rest_polling_task
+                except asyncio.CancelledError:
+                    pass
+                self._rest_polling_task = None
+            self.logger.info("Stopped REST polling task")
 
     def _parse_timestamp(self, value: str) -> Optional[datetime]:
         """Parse ISO timestamp strings."""
@@ -451,6 +539,58 @@ class TradingDashboard:
             return datetime.fromisoformat(ts_str)
         except ValueError:
             return None
+
+    async def poll_rest_market_data(self, immediate_first_poll: bool = False):
+        """Periodically fetch market data via REST while WebSocket is offline.
+
+        Args:
+            immediate_first_poll: If True, perform first poll immediately without delay
+        """
+        self.logger.info("Starting REST market data polling (5 second interval)")
+
+        first_poll = True
+        while self.running and self._rest_polling_active:
+            try:
+                # Skip delay on first poll if immediate_first_poll is True
+                if not first_poll or not immediate_first_poll:
+                    await asyncio.sleep(5)
+                first_poll = False
+
+                # Fetch price history from the last processed timestamp
+                start_time = self._latest_processed_timestamp
+                end_time = datetime.now(timezone.utc)
+
+                self.logger.info("Polling REST for market data from %s to %s", start_time, end_time)
+
+                # Request price history for the subscribed symbol
+                endpoint = f"/api/v1/prices?symbol={self.symbol}"
+                if start_time:
+                    endpoint += f"&start={start_time.isoformat()}"
+                endpoint += f"&end={end_time.isoformat()}"
+
+                resp = await self.network_manager.rest_request("GET", endpoint)
+
+                if resp and resp.status == 200:
+                    data = await resp.json()
+                    prices = data.get("prices", [])
+
+                    if prices:
+                        self.logger.info("Received %d price points from REST polling", len(prices))
+                        # Process the price data through the reconciliation handler
+                        self._handle_reconciliation("price_history", {
+                            "symbol": self.symbol,
+                            "prices": prices
+                        })
+                    else:
+                        self.logger.debug("No new price data available from REST")
+                else:
+                    self.logger.warning("REST polling failed with status %s",
+                                      resp.status if resp else "None")
+
+            except Exception as e:
+                self.logger.error("Error during REST market data polling: %s", e)
+
+        self.logger.info("REST market data polling stopped")
 
     async def update_account_state(self):
         """Periodically fetch account state via REST."""
@@ -813,10 +953,13 @@ class TradingDashboard:
         except KeyboardInterrupt:
             print("\nStopping dashboard...")
             self.running = False
-            # Close network manager connections
+            # Close network manager connections and stop REST polling
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                # Stop REST polling if active
+                if self._rest_polling_active:
+                    loop.run_until_complete(self._stop_rest_polling())
                 loop.run_until_complete(self.network_manager.close())
                 loop.close()
             except Exception as e:
