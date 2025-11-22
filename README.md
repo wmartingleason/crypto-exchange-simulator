@@ -23,7 +23,6 @@ Test systems against realistic infrastructure failures:
 
 ### Market Data
 - Geometric Brownian Motion (GBM) price model (placeholder)
-- Random walk models
 - Configurable tick intervals (millisecond precision)
 - Real-time market data streams
 
@@ -38,7 +37,7 @@ pip install -e ".[dev]"
 ### Run Server
 
 ```bash
-python -m exchange_simulator.server
+python -m src.exchange_simulator.server
 ```
 
 The server provides:
@@ -49,16 +48,9 @@ The server provides:
 
 ```bash
 # Launch trading dashboard (default mode)
-python -m client.client
+python -m src.client.client
 
-# Run infrastructure testing scenarios
-python -m client.client --scenarios
 
-# Custom symbol
-python -m client.client --symbol ETH/USD
-
-# Custom server URL
-python -m client.client --base-url http://localhost:9000
 ```
 
 The dashboard automatically integrates:
@@ -71,7 +63,7 @@ The dashboard automatically integrates:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   Exchange Server (aiohttp)                  │
+│                   Exchange Server (aiohttp)                 │
 │           REST API (/api/v1/*)  |  WebSocket (/ws)          │
 └──────────────────────────┬──────────────────────────────────┘
                            │
@@ -103,14 +95,14 @@ The dashboard automatically integrates:
                 └─────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
-│                          Client                              │
-│  ┌──────────────────────┐    ┌──────────────────────────┐  │
-│  │   Trading Dashboard  │    │  Infrastructure Testing  │  │
-│  │   (Dash + Plotly)    │    │     (Scenarios)          │  │
-│  └──────────────────────┘    └──────────────────────────┘  │
-│           │                              │                   │
+│                          Client                             │
+│  ┌──────────────────────┐    ┌──────────────────────────┐   │
+│  │   Trading Dashboard  │    │  Infrastructure Testing  │   │
+│  │   (Dash + Plotly)    │    │     (Scenarios)          │   │
+│  └──────────────────────┘    └──────────────────────────┘   │
+│           │                              │                  │
 │           └──────────┬───────────────────┘                  │
-│                      │                                       │
+│                      │                                      │
 │           ┌──────────▼──────────┐                           │
 │           │   ExchangeClient    │                           │
 │           │  REST + WebSocket   │                           │
@@ -245,6 +237,8 @@ Two latency modes are available:
 - **Typical link**: μ=5.0, σ=0.3 (typical network conditions, EV: ~155ms)
 
 Configure via `failures.latency.mode` in config.json. Latency simulation runs automatically for all WebSocket and REST API traffic.
+
+For production usage, it will be beneficial to gather latency data for individual exchanges and fit models to the data for analyzing trading strategies, since network connection is a significant point of failure in crypto trading.
 
 Quick example:
 
