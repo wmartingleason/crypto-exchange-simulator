@@ -177,7 +177,7 @@ await server.start()
 
 ## REST API
 
-See [REST_API.md](REST_API.md) for complete API documentation.
+See [docs/REST_API.md](docs/REST_API.md) for complete API documentation.
 
 ### Historical Price Data
 
