@@ -69,10 +69,10 @@ The dashboard automatically integrates:
                            │
                 ┌──────────┴──────────┐
                 │                     │
-         ┌──────▼──────┐      ┌──────▼──────┐
-         │  REST API   │      │  WebSocket  │
-         │   Handler   │      │   Handler   │
-         └──────┬──────┘      └──────┬──────┘
+         ┌──────▼──────┐       ┌──────▼──────┐
+         │  REST API   │       │  WebSocket  │
+         │   Handler   │       │   Handler   │
+         └──────┬──────┘       └──────┬──────┘
                 │                     │
                 │         ┌───────────▼───────────┐
                 │         │   Failure Injector    │
